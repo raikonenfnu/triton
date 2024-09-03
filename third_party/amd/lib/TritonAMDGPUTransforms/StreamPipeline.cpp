@@ -531,6 +531,8 @@ void LoopPipeliner::emitPrologue() {
     if (validLoads.contains(op)) {
       auto loadOp = cast<triton::LoadOp>(op);
       // Load from global -> regs
+      Value srcPointer = prologueMap.lookupOrDefault(loadOp.getPtr());
+      builder.setInsertionPointAfterValue(srcPointer);
       auto newLoadOp = cloneWithInferType(builder, op, prologueMap);
       Value loadVal = newLoadOp->getResult(0);
       // Convert from regs to shared mem
