@@ -433,7 +433,7 @@ static LogicalResult verifyRegionsImpl(Op &op) {
                             << " arguments, but given block with "
                             << block.getNumArguments() << " arguments";
   }
-  unsigned i = 0;
+  // unsigned i = 0;
   const auto &blockArgTypes = block.getArgumentTypes();
   for (unsigned i = 0; i < numArgs; ++i) {
     const auto &blockArgTy = blockArgTypes[i];
@@ -924,7 +924,7 @@ JoinOp::inferReturnTypes(MLIRContext *context, std::optional<Location> location,
   assert(isa<RankedTensorType>(operands[1].getType()));
 
   Value lhs = operands[0];
-  Value rhs = operands[1];
+  // Value rhs = operands[1];
   auto srcTy = cast<RankedTensorType>(lhs.getType());
 
   SmallVector<int64_t> retShape(srcTy.getShape());
