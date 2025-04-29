@@ -204,7 +204,8 @@ def profile_batch_kernels(M, N, K, gpuid, gpus, jobs, verbose):
             print(f"profiling {kernel_name} on GPU {gpuid}")
         here = Path(__file__).parent
         run_bash_command_wrapper(
-            f"PYTHONPATH={here} rocprof --stats -o {get_output_dir()}/results_{jobId}.csv python {get_filename_profile_driver(M, N, K, jobId)}",
+            #f"PYTHONPATH={here} rocprof --stats -o {get_output_dir()}/results_{jobId}.csv python {get_filename_profile_driver(M, N, K, jobId)}",
+            f"PYTHONPATH={here} python {get_filename_profile_driver(M, N, K, jobId)}",
             capture=(verbose < 2))
         jobId += ngpus
 
@@ -240,6 +241,7 @@ def tune_gemm_config(M, N, K, col_a, col_b, dtype_a, dtype_b, dtype_c, init_type
     for p in running:
         p.join()
 
+    exit()
     profile_end = datetime.now()
     profile_time = profile_end - compile_end
     if verbose:
