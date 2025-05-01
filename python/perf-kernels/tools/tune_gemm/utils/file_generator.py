@@ -30,7 +30,7 @@ def gen_configStr(config):
         config)
 
     ## {M}_{N}_{K} is removed since the same kernel can be used for differen gemm sizes
-    schedule_hint = schedule_hint.upper().replace('-', '_')
+    #schedule_hint = schedule_hint.upper().replace('-', '_')
     configStr = f"BM{block_m}_BN{block_n}_BK{block_k}_GM{group_m}_SK{split_k}_nW{num_warps}_nS{num_stages}_EU{waves_per_eu}_kP{kpack}_mfma{mfmaInstrSize}_sched{schedule_hint}"
 
     return configStr
