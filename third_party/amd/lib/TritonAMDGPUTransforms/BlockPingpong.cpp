@@ -356,11 +356,15 @@ void Pingponger::determineDotMemoryOps(tt::DotOp dotOp,
     for (auto &&user : subview->getUsers())
       if (auto localStore = dyn_cast<ttg::LocalStoreOp>(user))
         dotLocalStores.insert(localStore);
-  // else if (auto globalLoad = dyn_cast<ttg::AsyncCopyGlobalToLocalOp>(user)) {
-  //   dotGlobalLoads.insert(globalLoad)
-  //   assert(dotGlobalLoads->hasOneUse())
-  //   dotLocalStores.insert(globalLoad.users()[0])
-  // }
+      else if (auto globalLoad =
+                   dyn_cast<ttg::AsyncCopyGlobalToLocalOp>(user)) {
+        if (!globalLoad->hasOneUse() ||
+            !isa<ttg::AsyncCommitGroupOp>(*globalLoad->getUsers().begin())) {
+          continue;
+        }
+        dotGlobalLoads.insert(globalLoad);
+        dotLocalStores.insert(*globalLoad->getUsers().begin());
+      }
 
   // Determine the global loads from the local stores.
   // We expect this to just be a global load
@@ -534,6 +538,10 @@ LogicalResult Pingponger::transformFourPPClusters(OpBuilder &builder,
   // set insertion point at the last global_load where all the addresses are
   // ready to be used.
   updateOpInsertion(gLoadOps[1]);
+  if (isa<ttg::AsyncCopyGlobalToLocalOp>(gLoadOps[1])) {
+    appendOp(gLoadOps[1]);
+    appendOp(lStoreOps[1]);
+  }
   appendSlicedLoadAB(/*slice=*/0);
   appendClusterBarrier(builder, loc);
 
@@ -542,7 +550,8 @@ LogicalResult Pingponger::transformFourPPClusters(OpBuilder &builder,
   appendClusterBarrier(builder, loc);
 
   // mem1: global load B, local load A(2/4), local load B(2/4)
-  appendOp(gLoadOps[1]);
+  if (isa<tt::LoadOp>(gLoadOps[1]))
+    appendOp(gLoadOps[1]);
   appendSlicedLoadAB(/*slice=*/1);
   appendClusterBarrier(builder, loc);
 
@@ -560,11 +569,13 @@ LogicalResult Pingponger::transformFourPPClusters(OpBuilder &builder,
   appendClusterBarrier(builder, loc);
 
   // mem3: local store A and B
-  // Matmul kernels may use the output of the dot product in another operation
+  // Matmul kernels    of the dot product in another operation
   // before the local store (e.g. persistent matmul epilogue). To accommodate
   // such cases, we need to move the local store up in the loop.
-  moveOpAndPredecessorsUpSameBlock(lStoreOps[0]);
-  moveOpAndPredecessorsUpSameBlock(lStoreOps[1]);
+  if (isa<ttg::LocalStoreOp>(lStoreOps[0]))
+    moveOpAndPredecessorsUpSameBlock(lStoreOps[0]);
+  if (isa<ttg::LocalStoreOp>(lStoreOps[1]))
+    moveOpAndPredecessorsUpSameBlock(lStoreOps[1]);
   appendClusterBarrier(builder, loc);
 
   // dot3 (4/4)
@@ -741,11 +752,16 @@ void Pingponger::getDotPingponged() {
   auto lStoreIt = std::stable_partition(
       lStoreOps.begin(), lStoreOps.end(),
       [&dotLocalStores](Operation *op) { return dotLocalStores.contains(op); });
-  if (estimateNonDotMemoryImpact<tt::LoadOp>(gLoadIt, gLoadOps.end(),
-                                             assumeNotTaken) != 0) {
+  if (estimateNonDotMemoryImpact<ttg::AsyncCopyGlobalToLocalOp>(
+          gLoadIt, gLoadOps.end(), assumeNotTaken) != 0) {
     std::stringstream message;
+    message << "COUNT:"
+            << estimateNonDotMemoryImpact<ttg::AsyncCopyGlobalToLocalOp>(
+                   gLoadIt, gLoadOps.end(), assumeNotTaken)
+            << "\n";
+    message << "Size of dotGlobalLoads:" << dotGlobalLoads.size() << "\n";
     message << "Unable to match ping pong scheduling pattern. Details: "
-            << "Non-dot global loads found in non-persistent GEMM";
+            << "Non-dot WUT global loads found in non-persistent GEMM";
     LDBG(message.str());
     return;
   }
@@ -757,8 +773,8 @@ void Pingponger::getDotPingponged() {
     LDBG(message.str());
     return;
   }
-  if (estimateNonDotMemoryImpact<ttg::LocalStoreOp>(lStoreIt, lStoreOps.end(),
-                                                    assumeNotTaken) != 0) {
+  if (estimateNonDotMemoryImpact<ttg::AsyncCommitGroupOp>(
+          lStoreIt, lStoreOps.end(), assumeNotTaken) != 0) {
     std::stringstream message;
     message << "Unable to match ping pong scheduling pattern. Details: "
             << "Non-dot local stores found in non-persistent GEMM";
