@@ -34,9 +34,9 @@ namespace {
 // the performance of compute-bound cases.
 class Pingponger {
   scf::ForOp forOp;
-  SmallVector<tt::LoadOp> gLoadOps;
-  SmallVector<ttg::LocalLoadOp> lLoadOps;
-  SmallVector<ttg::LocalStoreOp> lStoreOps;
+  SmallVector<Operation *> gLoadOps;
+  SmallVector<Operation *> lLoadOps;
+  SmallVector<Operation *> lStoreOps;
   SmallVector<tt::DotOp> dotOps;
   SmallVector<SmallVector<Operation *>> subViewOps;
   SmallVector<SmallVector<Operation *>> loadSliceOps;
@@ -87,13 +87,14 @@ private:
   template <typename T>
   size_t countIfMemoryOps(scf::IfOp ifOp, bool assumeNotTaken);
   template <typename T>
-  size_t estimateNonDotMemoryImpact(T *start, T *end, bool assumeNotTaken);
+  size_t estimateNonDotMemoryImpact(Operation **start, Operation **end,
+                                    bool assumeNotTaken);
   void determineDotMemoryOps(tt::DotOp dotOp,
-                             DenseSet<tt::LoadOp> &dotGlobalLoads,
-                             DenseSet<ttg::LocalLoadOp> &dotLocalLoads,
-                             DenseSet<ttg::LocalStoreOp> &dotLocalStores);
+                             DenseSet<Operation *> &dotGlobalLoads,
+                             DenseSet<Operation *> &dotLocalLoads,
+                             DenseSet<Operation *> &dotLocalStores);
   template <typename T>
-  void findClosestPredOps(Value v, DenseSet<T> &matchingOps);
+  void findClosestPredOps(Value v, DenseSet<Operation *> &matchingOps);
 };
 
 void Pingponger::updateOpInsertion(Operation *op) { lastInsertedOp = op; }
@@ -235,7 +236,8 @@ bool Pingponger::isPersistentGemm(size_t num_dots) {
 // P from the given value v. This also includes "later" operations
 // for block arguments. Note: That we find all T for every path P.
 template <typename T>
-void Pingponger::findClosestPredOps(Value v, DenseSet<T> &matchingOps) {
+void Pingponger::findClosestPredOps(Value v,
+                                    DenseSet<Operation *> &matchingOps) {
   // Create a cache so we can traverse across block arguments.
   DenseSet<Operation *> visitedOps;
   std::function<void(Value)> impl;
@@ -292,7 +294,8 @@ size_t Pingponger::countIfMemoryOps(scf::IfOp ifOp, bool assumeNotTaken) {
 // rounded to an integer. This is used to determine any possible
 // influence on cluster setup.
 template <typename T>
-size_t Pingponger::estimateNonDotMemoryImpact(T *start, T *end,
+size_t Pingponger::estimateNonDotMemoryImpact(Operation **start,
+                                              Operation **end,
                                               bool assumeNotTaken) {
   DenseSet<Operation *> visitedParents;
   size_t count = 0;
@@ -329,10 +332,10 @@ size_t Pingponger::estimateNonDotMemoryImpact(T *start, T *end,
 //    the local stores.
 // Note: This function currently depends on num_stages=2, which is a
 // precondition for the pingpong scheduling.
-void Pingponger::determineDotMemoryOps(
-    tt::DotOp dotOp, DenseSet<tt::LoadOp> &dotGlobalLoads,
-    DenseSet<ttg::LocalLoadOp> &dotLocalLoads,
-    DenseSet<ttg::LocalStoreOp> &dotLocalStores) {
+void Pingponger::determineDotMemoryOps(tt::DotOp dotOp,
+                                       DenseSet<Operation *> &dotGlobalLoads,
+                                       DenseSet<Operation *> &dotLocalLoads,
+                                       DenseSet<Operation *> &dotLocalStores) {
   // Find the locals loads used to compute the dot inputs. These
   // must come before the dot op.
   findClosestPredOps<ttg::LocalLoadOp>(dotOp.getA(), dotLocalLoads);
@@ -342,20 +345,30 @@ void Pingponger::determineDotMemoryOps(
   // With pipelining we expect this to be a single local
   // store within the loop based on a block argument after routing through
   // a ttg.MemDescSubviewOp.
-  DenseSet<ttg::MemDescSubviewOp> subviews;
-  for (auto &&localLoad : dotLocalLoads)
-    findClosestPredOps<ttg::MemDescSubviewOp>(localLoad.getSrc(), subviews);
+  DenseSet<Operation *> subviews;
+  for (auto &&localLoad : dotLocalLoads) {
+    if (auto castedlocalLoad = dyn_cast<ttg::LocalLoadOp>(localLoad))
+      findClosestPredOps<ttg::MemDescSubviewOp>(castedlocalLoad.getSrc(),
+                                                subviews);
+  }
 
   for (auto &&subview : subviews)
     for (auto &&user : subview->getUsers())
       if (auto localStore = dyn_cast<ttg::LocalStoreOp>(user))
         dotLocalStores.insert(localStore);
+  // else if (auto globalLoad = dyn_cast<ttg::AsyncCopyGlobalToLocalOp>(user)) {
+  //   dotGlobalLoads.insert(globalLoad)
+  //   assert(dotGlobalLoads->hasOneUse())
+  //   dotLocalStores.insert(globalLoad.users()[0])
+  // }
 
   // Determine the global loads from the local stores.
   // We expect this to just be a global load
   // within the loop.
-  for (auto &&localStore : dotLocalStores)
-    findClosestPredOps<tt::LoadOp>(localStore.getSrc(), dotGlobalLoads);
+  for (auto &&localStore : dotLocalStores) {
+    if (auto castedlocalStore = dyn_cast<ttg::LocalStoreOp>(localStore))
+      findClosestPredOps<tt::LoadOp>(castedlocalStore.getSrc(), dotGlobalLoads);
+  }
 }
 
 // Transform a loop into one Dot - Memory (ping - pong) clusters
@@ -670,8 +683,8 @@ void Pingponger::getDotPingponged() {
   Location loc = forOp.getLoc();
 
   forOp->walk([&](Operation *op) {
-    if (auto gLoad = dyn_cast<tt::LoadOp>(op))
-      gLoadOps.push_back(gLoad);
+    if (isa<tt::LoadOp, ttg::AsyncCopyGlobalToLocalOp>(op))
+      gLoadOps.push_back(op);
     else if (auto lLoad = dyn_cast<ttg::LocalLoadOp>(op)) {
       // This scheduling doesn't help hiding intra-warp latency. So, we only
       // collect local_load ops that are software pipelined, which means their
@@ -681,8 +694,8 @@ void Pingponger::getDotPingponged() {
         if (auto tiedLoopInit = forOp.getTiedLoopInit(arg))
           if (tiedLoopInit->get())
             lLoadOps.push_back(lLoad);
-    } else if (auto lStore = dyn_cast<ttg::LocalStoreOp>(op))
-      lStoreOps.push_back(lStore);
+    } else if (isa<ttg::LocalStoreOp, ttg::AsyncCommitGroupOp>(op))
+      lStoreOps.push_back(op);
     else if (auto pingpongDot = dyn_cast<tt::DotOp>(op))
       if (pingpongDot.getType().getRank() == 2)
         dotOps.push_back(pingpongDot);
@@ -710,9 +723,9 @@ void Pingponger::getDotPingponged() {
   // which will not hold if we do not properly have a GEMM. As a result, we
   // filter the associated load operations to only those that are associated
   // // with the GEMM.
-  DenseSet<tt::LoadOp> dotGlobalLoads;
-  DenseSet<ttg::LocalLoadOp> dotLocalLoads;
-  DenseSet<ttg::LocalStoreOp> dotLocalStores;
+  DenseSet<Operation *> dotGlobalLoads;
+  DenseSet<Operation *> dotLocalLoads;
+  DenseSet<Operation *> dotLocalStores;
   determineDotMemoryOps(dotOps[0], dotGlobalLoads, dotLocalLoads,
                         dotLocalStores);
 
@@ -721,16 +734,13 @@ void Pingponger::getDotPingponged() {
   // the impact of any additional loads/stores.
   auto gLoadIt = std::stable_partition(
       gLoadOps.begin(), gLoadOps.end(),
-      [&dotGlobalLoads](tt::LoadOp op) { return dotGlobalLoads.contains(op); });
-  auto lLoadIt = std::stable_partition(lLoadOps.begin(), lLoadOps.end(),
-                                       [&dotLocalLoads](ttg::LocalLoadOp op) {
-                                         return dotLocalLoads.contains(op);
-                                       });
-  auto lStoreIt =
-      std::stable_partition(lStoreOps.begin(), lStoreOps.end(),
-                            [&dotLocalStores](ttg::LocalStoreOp op) {
-                              return dotLocalStores.contains(op);
-                            });
+      [&dotGlobalLoads](Operation *op) { return dotGlobalLoads.contains(op); });
+  auto lLoadIt = std::stable_partition(
+      lLoadOps.begin(), lLoadOps.end(),
+      [&dotLocalLoads](Operation *op) { return dotLocalLoads.contains(op); });
+  auto lStoreIt = std::stable_partition(
+      lStoreOps.begin(), lStoreOps.end(),
+      [&dotLocalStores](Operation *op) { return dotLocalStores.contains(op); });
   if (estimateNonDotMemoryImpact<tt::LoadOp>(gLoadIt, gLoadOps.end(),
                                              assumeNotTaken) != 0) {
     std::stringstream message;
