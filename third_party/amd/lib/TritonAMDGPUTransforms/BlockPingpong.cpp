@@ -538,10 +538,6 @@ LogicalResult Pingponger::transformFourPPClusters(OpBuilder &builder,
   // set insertion point at the last global_load where all the addresses are
   // ready to be used.
   updateOpInsertion(gLoadOps[1]);
-  if (isa<ttg::AsyncCopyGlobalToLocalOp>(gLoadOps[1])) {
-    appendOp(gLoadOps[1]);
-    appendOp(lStoreOps[1]);
-  }
   appendSlicedLoadAB(/*slice=*/0);
   appendClusterBarrier(builder, loc);
 
@@ -552,6 +548,10 @@ LogicalResult Pingponger::transformFourPPClusters(OpBuilder &builder,
   // mem1: global load B, local load A(2/4), local load B(2/4)
   if (isa<tt::LoadOp>(gLoadOps[1]))
     appendOp(gLoadOps[1]);
+  else if (isa<ttg::AsyncCopyGlobalToLocalOp>(gLoadOps[1])) {
+    appendOp(gLoadOps[1]);
+    appendOp(lStoreOps[1]);
+  }
   appendSlicedLoadAB(/*slice=*/1);
   appendClusterBarrier(builder, loc);
 
