@@ -457,7 +457,7 @@ LogicalResult Pingponger::genLocalSlice(OpBuilder &builder, Value v,
         v.getLoc(), subviewDescType, memDesc, offsetsVal);
     Value prefetchSlice = builder.create<ttg::LocalLoadOp>(
         v.getLoc(), RankedTensorType::get(shape, elementType, dotOperandEnc),
-        newSmem);
+        newSmem, localLoad.getToken());
     subviews.push_back(newSmem.getDefiningOp());
     slices.push_back(prefetchSlice.getDefiningOp());
   }
