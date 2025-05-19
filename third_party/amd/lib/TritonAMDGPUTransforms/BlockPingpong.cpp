@@ -9,6 +9,7 @@
 #include "third_party/amd/include/Dialect/TritonAMDGPU/IR/Dialect.h"
 #include "triton/Dialect/TritonGPU/IR/Dialect.h"
 #include "triton/Dialect/TritonGPU/Transforms/Utility.h"
+#include "llvm/ADT/ArrayRef.h"
 
 #define GEN_PASS_CLASSES
 #include "TritonAMDGPUTransforms/Passes.h"
@@ -78,6 +79,9 @@ private:
   LogicalResult genLocalSliceScales(OpBuilder &builder, Value v,
                                     Attribute dotEncoding, unsigned opIdx,
                                     unsigned numSlices, int64_t sliceWidth);
+  LogicalResult sliceAsyncCopy(OpBuilder &builder, Location loc,
+                               ttg::AsyncCopyGlobalToLocalOp op,
+                               unsigned numSlices);
   LogicalResult sliceDot(OpBuilder &builder, Location loc, tt::DotOp op,
                          unsigned numSlices);
   LogicalResult sliceDotScaled(OpBuilder &builder, Location loc,
@@ -736,6 +740,161 @@ LogicalResult Pingponger::genLocalSliceHelper(OpBuilder &builder, Value v,
 // Split dot into 'numSlices' pieces. This is required by pingpong scheduling
 // when it needs to schedule multiple dot clusters. Calls genLocalSlice to
 // create corresponding local_load slices.
+LogicalResult Pingponger::sliceAsyncCopy(OpBuilder &builder, Location loc,
+                                         ttg::AsyncCopyGlobalToLocalOp op,
+                                         unsigned numSlices) {
+  // Find original Async Commit Op.
+  if (!op->hasOneUse()) {
+    return failure();
+  }
+  auto origAsyncCommitOp =
+      dyn_cast<ttg::AsyncCommitGroupOp>(*op->getUsers().begin());
+  if (!origAsyncCommitOp) {
+    return failure();
+  }
+
+  // Find original async wait op.
+  if (!origAsyncCommitOp->hasOneUse()) {
+    return failure();
+  }
+  auto origAsyncWaitOp = dyn_cast<ttg::AsyncWaitOp>(*op->getUsers().begin());
+  if (!origAsyncWaitOp) {
+    return failure();
+  }
+  auto origAsyncWaitIt = llvm::find(asyncWaitOps, origAsyncWaitOp);
+  if (origAsyncWaitIt == asyncWaitOps.end()) {
+    return failure();
+  }
+  size_t asyncWaitToReplaceIdx =
+      std::distance(asyncWaitOps.begin(), origAsyncWaitIt);
+
+  // Find original dst memdesc_subview
+  auto origDstSharedMemory =
+      dyn_cast<ttg::MemDescSubviewOp>(op.getResult().getDefiningOp());
+  if (!origDstSharedMemory) {
+    return failure();
+  }
+
+  // Determine orignal and sliced source and encoding/layout.
+  auto srcPointers = op.getSrc();
+  auto encoding =
+      cast<ttg::BlockedEncodingAttr>(srcPointers.getType().getEncoding());
+  auto encodingOrder = encoding.getOrder();
+  SmallVector<unsigned> sizePerThread(encoding.getSizePerThread());
+  if (encodingOrder.size() != sizePerThread.size()) {
+    return failure();
+  }
+
+  // Slice fastest changing dimension.
+  unsigned slicedDim = encodingOrder[0];
+  if (sizePerThread[slicedDim] % numSlices != 0) {
+    return failure();
+  }
+  sizePerThread[slicedDim] /= numSlices;
+  auto newEncoding = ttg::BlockedEncodingAttr::get(
+      builder.getContext(), sizePerThread, encoding.getThreadsPerWarp(),
+      encoding.getWarpsPerCTA(), encoding.getOrder(), encoding.getCTALayout());
+
+  // Determine original and sliced shapes.
+  auto origMemDescType = cast<ttg::MemDescType>(origDstSharedMemory.getType());
+  auto origShape = origMemDescType.getShape();
+  SmallVector<int64_t> slicedShape(origShape);
+  if (slicedShape.size() != encodingOrder.size()) {
+    return failure();
+  }
+  if (slicedShape[slicedDim] % numSlices != 0) {
+    return failure();
+  }
+  slicedShape[slicedDim] /= numSlices;
+  ArrayRef<int64_t> slicedShapeRef(slicedShape);
+
+  // Helper lambda function to convert layout to prep for extract_slice.
+  auto convertLayout = [&](mlir::TypedValue<mlir::RankedTensorType> tensor) {
+    Value newTensor = nullptr;
+    RankedTensorType slicedTensorType = nullptr;
+    if (tensor) {
+      assert(encoding == tensor.getType().getEncoding());
+      auto elemType = tensor.getType().getElementType();
+      RankedTensorType newType =
+          RankedTensorType::get(origShape, elemType, newEncoding);
+      newTensor =
+          builder.create<ttg::ConvertLayoutOp>(tensor.getLoc(), newType, tensor)
+              .getResult();
+      slicedTensorType =
+          RankedTensorType::get(slicedShapeRef, elemType, newEncoding);
+    }
+    return std::make_tuple(newTensor, slicedTensorType);
+  };
+
+  // Helper lambda functions to extract/slice tensors.
+  auto extract = [&builder](Type resType, Value src,
+                            DenseI64ArrayAttr &offset) {
+    Value resValue = nullptr;
+    if (src) {
+      resValue = builder.create<triton::amdgpu::ExtractSliceOp>(
+          src.getLoc(), resType, src, offset);
+    }
+    return resValue;
+  };
+
+  // Convert sources' layout to be slicable.
+  mlir::TypedValue<mlir::RankedTensorType> origMask = nullptr;
+  mlir::TypedValue<mlir::RankedTensorType> origOtherTensor = nullptr;
+  if (auto value = op.getMask()) {
+    origMask = dyn_cast<decltype(origMask)>(value);
+  }
+  if (auto value = op.getOther()) {
+    origOtherTensor = cast<decltype(origOtherTensor)>(value);
+  }
+  auto [newSrcPointers, slicedSrcType] = convertLayout(srcPointers);
+  auto [newMask, slicedMaskType] = convertLayout(origMask);
+  auto [newOther, slicedOtherType] = convertLayout(origOtherTensor);
+  auto slicedType = ttg::MemDescType::get(
+      slicedShapeRef, origMemDescType.getElementType(),
+      origMemDescType.getEncoding(), origMemDescType.getMemorySpace(),
+      origMemDescType.getMutableMemory(), origMemDescType.getAllocShape());
+
+  // Create slices
+  SmallVector<Value> slicedCommits;
+  SmallVector<ttg::AsyncCopyGlobalToLocalOp> slicedCopies;
+  builder.setInsertionPoint(op);
+  for (int i = 0; i < numSlices; i++) {
+    SmallVector<int64_t> offset(slicedShape.size(), 0);
+    offset[slicedDim] = slicedShape[slicedDim] * i;
+    auto offsetAttr = DenseI64ArrayAttr::get(builder.getContext(), offset);
+
+    auto extractedSrc = extract(slicedSrcType, newSrcPointers, offsetAttr);
+    auto extractedMask = extract(slicedMaskType, newMask, offsetAttr);
+    auto extractedOther = extract(slicedOtherType, newOther, offsetAttr);
+
+    SmallVector<Value> offsetsVal;
+    for (int64_t off : offset) {
+      offsetsVal.push_back(builder.create<arith::ConstantIntOp>(
+          origDstSharedMemory.getLoc(), off, 32));
+    }
+    Value subviewSlice = builder.create<ttg::MemDescSubviewOp>(
+        origDstSharedMemory.getLoc(), slicedType, origDstSharedMemory,
+        offsetsVal);
+
+    auto newAsyncCopy = builder.create<ttg::AsyncCopyGlobalToLocalOp>(
+        op->getLoc(), extractedSrc, subviewSlice, extractedMask, extractedOther,
+        op.getCache(), op.getEvict(), op.getIsVolatile());
+
+    auto newCommit = builder.create<ttg::AsyncCommitGroupOp>(
+        op->getLoc(), newAsyncCopy.getToken());
+    slicedCommits.push_back(newCommit.getResult());
+  }
+  builder.setInsertionPoint(origAsyncWaitOp);
+  auto newAsyncWaitOp = builder.create<ttg::AsyncWaitOp>(
+      origAsyncWaitOp.getLoc(), slicedCommits, origAsyncWaitOp.getNum());
+  asyncWaitOps[asyncWaitToReplaceIdx] = newAsyncWaitOp;
+  origAsyncWaitOp.replaceAllUsesWith(newAsyncWaitOp.getResult());
+  return success();
+}
+
+// Split dot into 'numSlices' pieces. This is required by pingpong scheduling
+// when it needs to schedule multiple dot clusters. Calls genLocalSlice to
+// create corresponding local_load slices.
 LogicalResult Pingponger::sliceDot(OpBuilder &builder, Location loc,
                                    tt::DotOp op, unsigned numSlices) {
   builder.setInsertionPointToStart(forOp.getBody());
@@ -870,6 +1029,18 @@ LogicalResult Pingponger::transformFourPPClusters(OpBuilder &builder,
   // First, slice local_loads and dot into 4 parts
   if (sliceDot(builder, loc, dotOps[0], 4).failed())
     return failure();
+
+  // TODO: Test functionality and correctness
+  // TODO: sliceAsyncCopy on both lhs and rhs
+  // TODO: Let sliceAsyncCopy generate a slicedLhs, and slicedRhs respectively
+  // TODO: refactor into two pass, first analysis + give encoding/shapes
+  //       second actual execution.
+  // if (useAsyncCopy) {
+  //   if (failed(sliceAsyncCopy(builder, loc, asyncCopyOps[0], 2))) {
+  //     return failure();
+  //   }
+  // }
+
   Operation *gLoadRhs = useAsyncCopy ? asyncCopyOps[1] : gLoadOps[1];
   builder.setInsertionPointAfter(gLoadRhs);
   // Reorder operations into four mem/dot clusters
