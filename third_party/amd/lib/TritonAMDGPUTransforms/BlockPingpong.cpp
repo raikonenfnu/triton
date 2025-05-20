@@ -198,9 +198,10 @@ void Pingponger::appendSlicedLoadAB(int slice) {
 SmallVector<Operation *> Pingponger::genClusterBarrier(OpBuilder &builder,
                                                        Location loc) {
   //  MembarAnalysis can recognize gpu::BarrierOp and skip inserting additional
-  auto barrierOp = builder.create<gpu::BarrierOp>(loc);
-  auto schedBarrierOp = builder.create<ROCDL::SchedBarrier>(loc, 0);
-  return {barrierOp, schedBarrierOp};
+  auto firstSchedBarrierOp = builder.create<ROCDL::SchedBarrier>(loc, 0);
+  auto barrierOp = builder.create<ROCDL::SBarrierOp>(loc);
+  auto secondSchedBarrierOp = builder.create<ROCDL::SchedBarrier>(loc, 0);
+  return {firstSchedBarrierOp, barrierOp, secondSchedBarrierOp};
 }
 void Pingponger::appendClusterBarrier(OpBuilder &builder, Location loc) {
   for (auto &&op : genClusterBarrier(builder, loc))
@@ -586,7 +587,7 @@ LogicalResult Pingponger::pruneDotAsyncMemoryOps(
   // All PingPong Scheduler assumes there are 2 movable global loads and 2
   // movable local loads.
   if (asyncCopyOps.size() != 2 || lLoadOps.size() != 2 ||
-      asyncWaitOps.size() != 2) {
+      asyncWaitOps.size() != 1) {
     std::stringstream message;
     message << "Unable to match ping pong slicing pattern. Details: "
             << asyncCopyOps.size() << " global loads in dot computation, "
@@ -1040,6 +1041,36 @@ LogicalResult Pingponger::transformFourPPClusters(OpBuilder &builder,
   //     return failure();
   //   }
   // }
+  auto firstSubview = dyn_cast<ttg::MemDescSubviewOp>(subViewOps[0][0]);
+  auto secondSubview = dyn_cast<ttg::MemDescSubviewOp>(subViewOps[1][0]);
+  if (!firstSubview) {
+    return failure();
+  }
+  for (auto offset : firstSubview.getOffsets()) {
+    if (!offset.hasOneUse()) {
+      return failure();
+    }
+  }
+  builder.setInsertionPoint(asyncCopyOps[0]);
+  subViewOps[0][0]->moveBefore(asyncCopyOps[0]);
+  for (auto offset : firstSubview.getOffsets()) {
+    // if (offset.getParentRegion() == &forOp.getRegion()) {
+      // offset.getDefiningOp()->moveBefore(subViewOps[0][0]);
+    // }
+    offset.getDefiningOp()->moveBefore(subViewOps[0][0]);
+  }
+  updateOpInsertion(subViewOps[0][0]);
+  appendOp(loadSliceOps[0][0]);
+  appendOp(subViewOps[1][0]);
+  appendOp(loadSliceOps[1][0]);
+  for (auto offset : secondSubview.getOffsets()) {
+    // if (offset.getParentRegion() == &forOp.getRegion()) {
+      // offset.getDefiningOp()->moveBefore(subViewOps[0][0]);
+    // }
+    offset.getDefiningOp()->moveBefore(subViewOps[1][0]);
+  }
+  builder.create<ROCDL::SchedBarrier>(loc, 0);
+
 
   Operation *gLoadRhs = useAsyncCopy ? asyncCopyOps[1] : gLoadOps[1];
   builder.setInsertionPointAfter(gLoadRhs);
@@ -1049,23 +1080,23 @@ LogicalResult Pingponger::transformFourPPClusters(OpBuilder &builder,
   // set insertion point at the last global_load where all the addresses are
   // ready to be used.
   updateOpInsertion(gLoadRhs);
-  appendSlicedLoadAB(/*slice=*/0);
   appendClusterBarrier(builder, loc);
 
   // dot0 (1/4)
-  appendOpWithPrio(builder, dotSliceOps[0], loc);
+  appendOp(dotSliceOps[0]);
   appendClusterBarrier(builder, loc);
 
   // mem1: global load B, local load A(2/4), local load B(2/4)
+  appendSlicedLoadAB(/*slice=*/1);
+  appendOp(builder.create<ROCDL::SchedBarrier>(loc, 0));
   appendOp(gLoadRhs);
   if (useAsyncCopy) {
     appendOp(asyncCommitOps[1]);
   }
-  appendSlicedLoadAB(/*slice=*/1);
   appendClusterBarrier(builder, loc);
 
   // dot1 (2/4)
-  appendOpWithPrio(builder, dotSliceOps[1], loc);
+  appendOp(dotSliceOps[1]);
   appendClusterBarrier(builder, loc);
 
   // mem2: local load A(3/4, 4/4), local load B(3/4, 4/4)
@@ -1074,23 +1105,25 @@ LogicalResult Pingponger::transformFourPPClusters(OpBuilder &builder,
   appendClusterBarrier(builder, loc);
 
   // dot2 (3/4)
-  appendOpWithPrio(builder, dotSliceOps[2], loc);
-  appendClusterBarrier(builder, loc);
+  appendOp(dotSliceOps[2]);
 
   // mem3: local store A and B
   // Matmul kernels may use the output of the dot product in another operation
   // before the local store (e.g. persistent matmul epilogue). To accommodate
   // such cases, we need to move the local store up in the loop.
   if (!useAsyncCopy) {
+    appendClusterBarrier(builder, loc);
     moveOpAndPredecessorsUpSameBlock(lStoreOps[0]);
     moveOpAndPredecessorsUpSameBlock(lStoreOps[1]);
     appendClusterBarrier(builder, loc);
   } else {
+    appendOp(builder.create<ROCDL::SchedBarrier>(loc, 0));
     appendOp(asyncWaitOps[0]);
-    appendOp(asyncWaitOps[1]);
+    appendOp(builder.create<ROCDL::SchedBarrier>(loc, 0));
+    // appendOp(asyncWaitOps[1]);
   }
   // dot3 (4/4)
-  appendOpWithPrio(builder, dotSliceOps[3], loc);
+  appendOp(dotSliceOps[3]);
 
   // Move the cluster barrier to the end of the main loop.
   // This helps ensure that with persistent GEMMs the epilogue
