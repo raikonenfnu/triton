@@ -83,7 +83,7 @@ class PerfData:
         return max(min_t_flop, min_t_bw) / self.time
 
 
-def bench_mlp(batch, dim1, dim2, n_expts_tot, n_expts_act, x_dtype, w_dtype, TP, EP, name):
+def bench_mlp(batch, dim1, dim2, dim3, n_expts_tot, n_expts_act, x_dtype, w_dtype, TP, EP, name):
     assert n_expts_tot % EP == 0
     assert dim2 % TP == 0
     dev = "cuda"
@@ -92,11 +92,12 @@ def bench_mlp(batch, dim1, dim2, n_expts_tot, n_expts_act, x_dtype, w_dtype, TP,
     # weights
     wg = torch.randn((dim1, n_expts_tot), device=dev)
     w1 = torch.randn((n_expts_tot // EP, dim1, dim2 // TP), device=dev)
-    w2 = torch.randn((n_expts_tot // EP, dim2 // TP // 2, dim1), device=dev)
+    w2 = torch.randn((n_expts_tot // EP, dim2 // TP // 2, dim3), device=dev)
+    #w2 = torch.randn((n_expts_tot // EP, dim2 // TP, dim3), device=dev)
     # biases
     bg = torch.randn((n_expts_tot, ), device=dev)
     b1 = torch.randn((n_expts_tot // EP, dim2 // TP), device=dev)
-    b2 = torch.randn((n_expts_tot // EP, dim1), device=dev)
+    b2 = torch.randn((n_expts_tot // EP, dim3), device=dev)
 
     # -- numerics --
     optg = dict()
@@ -117,6 +118,8 @@ def bench_mlp(batch, dim1, dim2, n_expts_tot, n_expts_act, x_dtype, w_dtype, TP,
                 scale_layout = GFX950MXScaleLayout
         opt1 = {"value_layout": value_layout, "scale_layout": scale_layout}
         opt2 = deepcopy(opt1)
+        if TP > 1:
+            opt2['scale_layout'] = StridedLayout
     wg, wg_flex, wg_scale = quantize(wg, "bf16", dev, **optg)
     w1, w1_flex, w1_scale = quantize(w1, w_dtype, dev, **opt1)
     w2, w2_flex, w2_scale = quantize(w2, w_dtype, dev, **opt2)
@@ -151,8 +154,15 @@ def bench_mlp(batch, dim1, dim2, n_expts_tot, n_expts_act, x_dtype, w_dtype, TP,
     # -- analyze --
     gf, _, _, info = viewer.read(fpath)
     # Now the dataframe only contains leave nodes (i.e., kernels) that perform matmuls
+
+    # Overall perf
     # matmuls = gf.filter("MATCH ('*', c) WHERE c.'name' =~ '.*matmul.*' AND c IS LEAF").dataframe
+
+    # moe1
     matmuls = gf.filter("MATCH ('*', c) WHERE c.'name' =~ '.*matmul.*swiglu*' AND c IS LEAF").dataframe
+
+    # moe2
+    # matmuls = gf.filter(f"MATCH ('*', c) WHERE c.'name' =~ '.*matmul.*N = {dim1}*' AND c IS LEAF").dataframe
     bytes = matmuls["bytes"].sum()
     flops = sum(matmuls[[c for c in ["flops8", "flops16"] if c in matmuls.columns]].sum())
     time = matmuls["time (ns)"].sum()
@@ -163,7 +173,7 @@ def bench_mlp(batch, dim1, dim2, n_expts_tot, n_expts_act, x_dtype, w_dtype, TP,
                     device_info=device_info)
 
 
-def roofline_mlp(batch_ranges, dim1, dim2, n_expts_tot, n_expts_act, x_dtype, w_dtype, TP=1, EP=1, name="",
+def roofline_mlp(batch_ranges, dim1, dim2, dim3, n_expts_tot, n_expts_act, x_dtype, w_dtype, TP=1, EP=1, name="",
                  verbose=True):
     from itertools import chain
     from bisect import bisect_left
@@ -174,9 +184,8 @@ def roofline_mlp(batch_ranges, dim1, dim2, n_expts_tot, n_expts_act, x_dtype, w_
     print(f"Benchmarking {bench_case}...")
     print("===============================================================")
     for batch in batches:
-        perfs += [bench_mlp(batch, dim1, dim2, n_expts_tot, n_expts_act, x_dtype, w_dtype, TP, EP, name)]
+        perfs += [bench_mlp(batch, dim1, dim2, dim3, n_expts_tot, n_expts_act, x_dtype, w_dtype, TP, EP, name)]
         if verbose:
-            # print(f"Batch: {batch}; Util: {perfs[-1].util}; TFLOPS: {perfs[-1].tflops}; TBPS: {perfs[-1].tbps}")
             print(
                 f"Batch: {batch}; Kernel Latency (us): {perfs[-1].time * 1e-3 * 1e-2}; Util: {perfs[-1].util}; TFLOPS: {perfs[-1].tflops}; TBPS: {perfs[-1].tbps}"
             )
@@ -230,5 +239,5 @@ if __name__ == "__main__":
     # batch_ranges_moe = [(8192, 8200, 32)]
 
     quantized_dtypes = ["bf16", "mx4"]
-    roofline_mlp(batch_ranges_moe, 6144, 3072, 128, 4, *quantized_dtypes, TP=1, EP=1, name="oai")
+    roofline_mlp(batch_ranges_moe, 3072, 6144, 3072, 128, 4, *quantized_dtypes, TP=1, EP=1, name="oai")
     # roofline_mlp(batch_ranges_moe, 5888, 3072, 128, 4, *quantized_dtypes, TP=1, EP=1, name="oai")
