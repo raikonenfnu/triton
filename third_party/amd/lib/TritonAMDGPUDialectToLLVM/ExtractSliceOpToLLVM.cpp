@@ -33,6 +33,7 @@ struct ExtractSliceOpConversion
 
     auto vals = unpackLLElements(loc, adaptor.getSource(), rewriter);
     auto shapePerCTATile = triton::gpu::getShapePerCTATile(srcTy);
+    llvm::outs() <<  "shapePerCTATile: " << shapePerCTATile[0] << "," << shapePerCTATile[1] << "\n";
     auto srcCTAShape = LLVM::AMD::multiDimElementwise<int64_t, unsigned>(
         srcShape, shapePerCTATile, std::divides<unsigned>());
     auto dstCTAShape = LLVM::AMD::multiDimElementwise<int64_t, unsigned>(

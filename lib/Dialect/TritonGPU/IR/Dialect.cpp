@@ -986,6 +986,30 @@ SmallVector<unsigned> LinearEncodingAttr::getShapePerCTATile() const {
        llvm::zip(sizePerThread, threadsPerWarp, warpsPerCTA)) {
     shape.push_back(size * thread * warp);
   }
+  llvm::outs() << "sizePerThread:";
+  for (auto threadSize : sizePerThread) {
+    llvm::outs() <<threadSize << ",";
+  }
+  llvm::outs() <<"\n";
+
+  llvm::outs() << "threadsPerWarp:";
+  for (auto threadSize : threadsPerWarp) {
+    llvm::outs() <<threadSize << ",";
+  }
+  llvm::outs() <<"\n";
+
+
+  llvm::outs() << "warpsPerCTA:";
+  for (auto threadSize : warpsPerCTA) {
+    llvm::outs() <<threadSize << ",";
+  }
+  llvm::outs() <<"\n";
+
+
+  // llvm::outs() << "\n";
+  // llvm::outs() << "sizePerThread: " << sizePerThread <<"\n"; 
+  // llvm::outs() << "threadsPerWarp: " << threadsPerWarp <<"\n"; 
+  // llvm::outs() << "warpsPerCTA: " << warpsPerCTA <<"\n"; 
   return shape;
 }
 

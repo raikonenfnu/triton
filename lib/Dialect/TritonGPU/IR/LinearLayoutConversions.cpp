@@ -732,10 +732,11 @@ LinearLayout mfmaDotToLinearLayout(DotOperandEncodingAttr dotMfmaLayout,
 
   int32_t kWidth = dotMfmaLayout.getKWidth();
   auto kDimIndex = dotMfmaLayout.getOpIdx() == 0 ? rank - 1 : rank - 2;
+  auto nonKDimIndex = dotMfmaLayout.getOpIdx() == 0 ? rank - 2 : rank - 1;
 
   auto warpsPerCTA = mfmaLayout.getWarpsPerCTA();
   auto tilesPerWarp = mfmaLayout.getTilesPerWarp();
-  auto tilePerWarpNonK = tilesPerWarp[kDimIndex];
+  auto tilePerWarpNonK = tilesPerWarp[nonKDimIndex];
 
   auto mDim = mfmaLayout.getMDim();
   auto nDim = mfmaLayout.getNDim();
@@ -786,15 +787,26 @@ LinearLayout mfmaDotToLinearLayout(DotOperandEncodingAttr dotMfmaLayout,
 
   // If shape K is larger than the tile size, repeat the tile
   // along the K dimension.
+  llvm::outs() << "K-SIZE:" << kSize << "\n";
+  llvm::outs() << "kTileSize:" << kTileSize << "\n";
+  llvm::outs() << "kRatio:" << kSize / kTileSize << "\n";
   if (kSize > kTileSize) {
     tileLayout *= LinearLayout::identity1D(kSize / kTileSize, kRegister, dimK);
   }
 
   // Follow the tiles per warp property, repeat the tile layout
   // along the non-K dimension.
+  llvm::outs()<<"tile per warp non K: " << tilePerWarpNonK << "\n";
+  llvm::outs()<<"dim non K: " << dimNonK << "\n";
   tileLayout *= LinearLayout::identity1D(tilePerWarpNonK, kRegister, dimNonK);
-
-  tileLayout = tileLayout.transposeOuts({dimK, dimNonK});
+  // auto sizePerThread = tileLayout.getSizePerThread();
+  // llvm::outs() << "tileSizePerThread:";
+  // for (auto threadSize : sizePerThread) {
+  //   llvm::outs() <<threadSize << ",";
+  // }
+  
+  if (dotMfmaLayout.getOpIdx() == 1)
+    tileLayout = tileLayout.transposeOuts({dimK, dimNonK});
   if (hasBatchDim) {
     assert(order[2] == 0);
     // Extend the base vector with one value to accommodate for the batch

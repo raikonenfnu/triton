@@ -162,6 +162,11 @@ LogicalResult ExtractSliceOp::verify() {
   auto offsets = getStaticOffsets();
   auto shapePerCTATile = mlir::triton::gpu::getShapePerCTATile(srcTy);
   size_t rank = srcShape.size();
+  llvm::outs()<<"Shape Per CTA tile:";
+  for (size_t i = 0; i < rank; i++) {
+    llvm::outs() << shapePerCTATile[i] << ", ";
+  }
+  llvm::outs()<<"\n";
 
   auto failDim = [&](StringRef msg, int i) -> LogicalResult {
     return emitError(msg) << " at dimension " << i;
