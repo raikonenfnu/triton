@@ -2484,7 +2484,7 @@ def minimum(x, y, propagate_nan: constexpr = PropagateNan.NONE, _semantic=None):
 
 
 @builtin
-def maximum(x, y, propagate_nan: constexpr = PropagateNan.NONE, _semantic=None):
+def maximum(x, y, propagate_nan: constexpr = PropagateNan.ALL, _semantic=None):
     """
     Computes the element-wise maximum of :code:`x` and :code:`y`.
 
