@@ -698,6 +698,8 @@ LogicalResult Pingponger::transformChainedDotSchedule(OpBuilder &builder,
   // ComputeCluster 1
   updateOpInsertion(dotOps[0]);
   prependOp(builder.create<ROCDL::IglpOpt>(loc, 10), true);
+  prependOp(builder.create<ROCDL::SBarrierOp>(loc), false);
+  prependOp(builder.create<ROCDL::SchedBarrier>(loc, 0), false);
 
   // MemoryCluster 1
   updateOpInsertion(memoryClusterStartOps[0]);
@@ -758,12 +760,12 @@ LogicalResult Pingponger::transformChainedDotSchedule(OpBuilder &builder,
   //
   // s_setprio 0
   // s_waitcnt lgkmcnt(0)
+  // s_cbranch
   // s_barrier
   updateOpInsertion(lastInsertedOp->getBlock()->getTerminator());
   prependOp(builder.create<ROCDL::SchedBarrier>(loc, 0), false);
   prependOp(builder.create<ROCDL::SetPrioOp>(loc, lowPriority), false);
   prependOp(builder.create<ROCDL::SWaitcntOp>(loc, ldsOnlyBits), false);
-  prependOp(builder.create<ROCDL::SBarrierOp>(loc), false);
 
   return success();
 }
