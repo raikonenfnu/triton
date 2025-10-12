@@ -2,14 +2,143 @@ from triton.backends.compiler import BaseBackend, GPUTarget, Language
 from triton._C.libtriton import ir, passes, llvm, amd
 from triton import knobs
 from dataclasses import dataclass
-from typing import Any, Dict, Tuple
+from typing import Any, Dict, Tuple, List
 from types import ModuleType
 import hashlib
 import tempfile
 import re
+import os
 import functools
 import warnings
 from pathlib import Path
+
+import re
+from typing import Tuple, List
+
+def pack_v_mul_in_asm(asm_text: str, leave_unpacked: int = 6) -> str:
+    """
+    Process an AMDGPU assembly string to pack v_mul_f32_e32 instructions
+    into v_pk_mul_f32 where possible, following these rules:
+      - Operate between '=>This Inner Loop Header: Depth=1' and '; sched_barrier mask(0x00000000)'
+      - Find the last mfma instruction in that region
+      - Keep exactly `leave_unpacked` unpacked muls right after mfma
+      - Pack all other eligible pairs (even:odd dst registers)
+    Returns the modified assembly text.
+    """
+
+    START_MARKER = "=>This Inner Loop Header: Depth=1"
+    END_MARKER = "; iglp_opt mask(0x0000000A)"
+    V_MUL_RE = re.compile(r"^\s*v_mul_f32_e32\s+v(\d+),\s*v\d+,\s*v(\d+)")
+    MFMA_RE = re.compile(r"^\s*v_mfma")
+    LOC_RE = re.compile(r"^\s*\.loc")
+
+    # helper: parse a v_mul line
+    def parse_v_mul(line: str):
+        m = V_MUL_RE.match(line)
+        if not m:
+            return None
+        dst = int(m.group(1))
+        src = int(m.group(2))
+        indent = line[: len(line) - len(line.lstrip())]
+        return dst, src, indent, line
+
+    # helper: create packed line
+    def make_packed_line(dst_even: int, src_even: int, indent: str) -> str:
+        return f"{indent}v_pk_mul_f32 v[{dst_even}:{dst_even+1}], v[{src_even}:{src_even+1}], v[{dst_even}:{dst_even+1}] op_sel:[1,0]"
+
+    # extract region
+    if START_MARKER not in asm_text or END_MARKER not in asm_text:
+        return asm_text  # region not found
+
+    start_idx = asm_text.index(START_MARKER)
+    end_idx = asm_text.index(END_MARKER, start_idx)
+    pre = asm_text[:start_idx]
+    region = asm_text[start_idx:end_idx + len(END_MARKER)]
+    post = asm_text[end_idx + len(END_MARKER):]
+
+    lines = region.splitlines(keepends=False)
+
+    # find last mfma index
+    last_mfma_idx = None
+    for i, ln in enumerate(lines):
+        if MFMA_RE.match(ln):
+            last_mfma_idx = i
+    if last_mfma_idx is None:
+        return asm_text
+
+    # gather mul and .loc lines after mfma
+    mul_lines = []
+    loc_lines = []
+    for ln in lines[last_mfma_idx + 1:]:
+        if LOC_RE.match(ln):
+            loc_lines.append(ln)
+            continue
+        if V_MUL_RE.match(ln):
+            mul_lines.append(ln)
+            continue
+        break
+
+    if not mul_lines:
+        return asm_text
+
+    # parse muls
+    parsed = []
+    for ln in mul_lines:
+        p = parse_v_mul(ln)
+        if p:
+            parsed.append(p)
+
+    dsts = sorted([p[0] for p in parsed])
+    dst_map = {p[0]: p for p in parsed}
+
+    # identify pairs
+    dst_set = set(dsts)
+    pair_lefts = [d for d in dsts if d % 2 == 0 and (d + 1) in dst_set]
+    pair_rights = [d + 1 for d in pair_lefts]
+    in_pair = set(pair_lefts) | set(pair_rights)
+    isolated = [d for d in dsts if d not in in_pair]
+
+    # select unpacked dsts (prioritize isolated, then smallest remaining)
+    unpacked = []
+    for d in isolated:
+        if len(unpacked) < leave_unpacked:
+            unpacked.append(d)
+    for d in dsts:
+        if len(unpacked) >= leave_unpacked:
+            break
+        if d not in unpacked:
+            unpacked.append(d)
+    unpacked_set = set(unpacked)
+
+    # build packed pairs
+    packed_lines = []
+    used = set()
+    for d in sorted(dsts):
+        if d in unpacked_set or d in used or d % 2 != 0:
+            continue
+        if (d + 1) in dst_set and (d + 1) not in unpacked_set:
+            _, src, indent, _ = dst_map[d]
+            packed_lines.append(make_packed_line(d, src - src % 2, indent))
+            used.add(d)
+            used.add(d + 1)
+
+    # leftover unpacked lines
+    unpacked_lines = []
+    for d in sorted(dsts):
+        if d in used:
+            continue
+        _, _, _, orig = dst_map[d]
+        if d in unpacked_set or d not in dst_set:
+            unpacked_lines.append(orig)
+
+    # rebuild region
+    new_lines = lines[: last_mfma_idx + 1]
+    new_lines.extend(loc_lines)
+    new_lines.extend(unpacked_lines)
+    new_lines.extend(packed_lines)
+    new_region = "\n".join(new_lines)
+
+    return pre + new_region + "\n" + post
 
 
 def get_min_dot_size(target: GPUTarget):
@@ -442,6 +571,20 @@ class HIPBackend(BaseBackend):
         features = '-real-true16' if 'gfx11' in options.arch else ''
         amdgcn = llvm.translate_to_asm(src, amd.TARGET_TRIPLE, options.arch, features, flags, options.enable_fp_fusion,
                                        False)
+        if 'attn_fwd' in amdgcn:
+            #print("compiling fwd kernel!")
+            if "AMD_INSERT_AMDGCN" in os.environ.keys():
+                insert_module_path = str(os.environ["AMD_INSERT_AMDGCN"])
+                if not os.path.exists(insert_module_path):
+                    raise RuntimeError(f'cannot find amdgcn file to insert. Given: `{insert_module_path}`')
+                with open(insert_module_path, "r") as file:
+                    file_content = file.readlines()
+                amdgcn = ''.join(file_content)
+        else:
+            print("compiling else kernel!")
+
+        amdgcn = pack_v_mul_in_asm(amdgcn)
+
         if knobs.amd.dump_amdgcn:
             print("// -----// AMDGCN Dump //----- //")
             print(amdgcn)
