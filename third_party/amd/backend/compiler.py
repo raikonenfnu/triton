@@ -583,7 +583,11 @@ class HIPBackend(BaseBackend):
         else:
             print("compiling else kernel!")
 
-        amdgcn = pack_v_mul_in_asm(amdgcn)
+        ## The following is used to manually pack unpacked v_mul
+        ## instructions not hidden by mfma
+        ## With the new custom llvm branch, we don't need it anymore
+        ## [TritonInterleaveAndRematRebase2](https://github.com/kerbowa/llvm-project/tree/TritonInterleaveAndRematRebase2) @7988aac08017b253
+        #amdgcn = pack_v_mul_in_asm(amdgcn)
 
         if knobs.amd.dump_amdgcn:
             print("// -----// AMDGCN Dump //----- //")
