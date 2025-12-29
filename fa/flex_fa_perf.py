@@ -21,6 +21,7 @@ Currently only the forward kernel is supported, and contains these features:
 """
 
 import argparse
+import csv
 import subprocess
 import pytest
 import sys
@@ -1935,41 +1936,45 @@ def varlen_benchmark_configs():
     return configs
 
 
-def model_benchmark_configs(args):
-    config_file = args.model_configs
-    configs = get_model_configs(config_path=config_file, model_families=["llama3"], model=args.model)
+def model_benchmark_configs(model_configs="model_configs.json", model=None, b=0, sq=0, sk=0):
+    config_file = model_configs
+    configs = get_model_configs(config_path=config_file, model_families=["llama3"], model=model)
     fa_configs = []
-    batch_size = args.b if args.b else 1
+    batch_size = b if b else 1
 
     for model_name, config in configs.items():
         HQ = config["num_attention_heads"]
         HK = HQ if config["num_key_value_heads"] is None else config["num_key_value_heads"]
-        N_CTX_Q = args.sq if args.sq else 8192
-        N_CTX_K = args.sk if args.sk else N_CTX_Q
+        N_CTX_Q = sq if sq else 8192
+        N_CTX_K = sk if sk else N_CTX_Q
         HEAD_DIM = config["hidden_size"] // HQ
         fa_configs.append((model_name, batch_size, HQ, HK, N_CTX_Q, N_CTX_K, HEAD_DIM))
 
     return fa_configs
 
 
-def run_benchmark(custom, args):
+def run_benchmark(custom, b=0, hq=0, hk=0, sq=0, sk=0, d=0, attn_type="noop", dtype='fp16', 
+                  layout='bhsd', return_time=False, int8=False, quantize_p=False, 
+                  int8_kv=False, persistent=None, equal_seqlens=False, model=None, 
+                  model_configs="model_configs.json"):
 
-    dtype = arg_to_torch_dtype[args.dtype]
-    hk = args.hq if not args.hk else args.hk
-    sk = args.sq if not args.sk else args.sk
-    head_size = 128 if not args.d else args.d
+    dtype = arg_to_torch_dtype[dtype]
+    hk_val = hq if not hk else hk
+    sk_val = sq if not sk else sk
+    head_size = 128 if not d else d
     mode = 'fwd'
     x_names = ['BATCH', 'HQ', 'HK', 'N_CTX_Q', 'N_CTX_K']
-    causal = (args.causal == 1) if not args.model else True
-    int8 = args.int8
-    quantize_p = args.quantize_p and int8
-    int8_kv = args.int8_kv and int8
-    varlen = True if args.model else args.layout == 'thd'
+    is_causal = attn_type in ["causal", "alibi"]
+    causal_val = is_causal if not model else True
+    int8_val = int8
+    quantize_p_val = quantize_p and int8_val
+    int8_kv_val = int8_kv and int8_val
+    varlen = True if model else layout == 'thd'
     configs = []
-    plot_name = f'fused-attention-{mode}-d{head_size}-layout{args.layout}-causal{args.causal}'
-    extra_args = {'D_HEAD': head_size, 'dtype': dtype, 'causal': causal, 'mode': mode}
+    plot_name = f'fused-attention-{mode}-d{head_size}-layout{layout}-causal{is_causal}'
+    extra_args = {'D_HEAD': head_size, 'dtype': dtype, 'causal': causal_val, 'mode': mode}
     if custom:
-        x_vals_list = [(args.b, args.hq, hk, args.sq, sk)]
+        x_vals_list = [(b, hq, hk_val, sq, sk_val)]
     else:
         if varlen:
             x_vals_list = varlen_benchmark_configs()
@@ -1984,24 +1989,27 @@ def run_benchmark(custom, args):
                     new_x.append(v)
             x_vals_list = new_x
 
-        if args.model:
-            x_vals_list = model_benchmark_configs(args)
+        if model:
+            x_vals_list = model_benchmark_configs(model_configs=model_configs, model=model, b=b, sq=sq, sk=sk)
             x_names = ['model', 'BATCH', 'HQ', 'HK', 'N_CTX_Q', 'N_CTX_K', 'D_HEAD']
-            plot_name = f'fused-attention-{mode}-layout{args.layout}'
-            extra_args = {'dtype': dtype, 'causal': causal, 'mode': mode}
-    print_time = args.return_time
+            plot_name = f'fused-attention-{mode}-layout{layout}'
+            extra_args = {'dtype': dtype, 'causal': causal_val, 'mode': mode}
+    print_time = return_time
 
-    line_vals = ['triton', 'torch']  # 'Time (ms)' if print_time else 'TFLOPS'
+    # Store results to return
+    benchmark_results = []
+
+    line_vals = ['triton']  # 'Time (μs)' if print_time else 'TFLOPS'
     configs.append(
         triton.testing.Benchmark(x_names=x_names, x_vals=x_vals_list, line_arg='provider', line_vals=line_vals,
-                                 line_names=line_vals, styles=[('green', '-'), ('red', '-')],
-                                 ylabel='Time (ms)' if print_time else 'TFLOPS', plot_name=plot_name, args=extra_args))
+                                 line_names=line_vals, styles=[('green', '-')],
+                                 ylabel='Time (μs)' if print_time else 'TFLOPS', plot_name=plot_name, args=extra_args))
 
     @triton.testing.perf_report(configs)
     def bench_flash_attention(BATCH, HQ, HK, N_CTX_Q, N_CTX_K, D_HEAD, dtype, causal, mode, provider, device="cuda",
                               model=None):
         assert mode in ["fwd", "bwd"]
-        assert not (int8_kv and quantize_p)
+        assert not (int8_kv_val and quantize_p_val)
         warmup = 25
         rep = 100
         # TODO: Enable bias after testing.
@@ -2019,7 +2027,7 @@ def run_benchmark(custom, args):
         flops_per_matmul = 0
         if varlen:
             q, k, v, input_metadata = varlen_input_helper(BATCH, HQ, HK, N_CTX_Q, N_CTX_K, D_HEAD, dtype,
-                                                          args.equal_seqlens)
+                                                          equal_seqlens)
             for i in range(0, input_metadata.num_contexts):
                 seqlen_q = (input_metadata.cu_seqlens_q[i + 1] - input_metadata.cu_seqlens_q[i]).item()
                 seqlen_k = (input_metadata.cu_seqlens_k[i + 1] - input_metadata.cu_seqlens_k[i]).item()
@@ -2043,7 +2051,7 @@ def run_benchmark(custom, args):
                 else:
                     flops_per_matmul += seqlen_q * seqlen_k * HQ * D_HEAD * 2
         else:
-            q, k, v, input_metadata = input_helper(BATCH, HQ, HK, N_CTX_Q, N_CTX_K, D_HEAD, dtype, args.layout)
+            q, k, v, input_metadata = input_helper(BATCH, HQ, HK, N_CTX_Q, N_CTX_K, D_HEAD, dtype, layout)
             if causal:
                 # Same calculation as if varlen/if causal above
                 valid_out_elements = ((N_CTX_K**2 + N_CTX_K) / 2) if N_CTX_Q > N_CTX_K else \
@@ -2054,45 +2062,41 @@ def run_benchmark(custom, args):
         if causal:
             input_metadata.need_causal()
 
-        if "triton" in provider:
-            o = torch.empty_like(q)
-            if int8:
-                q, k, v = quantize_input(q, k, v, input_metadata, quantize_p=quantize_p, int8_kv=int8_kv)
-            input_metadata.set_persistent(args.persistent)
-            fn = lambda: attention(q, k, v, o, input_metadata)
-            if mode == 'bwd':
-                o, _, _ = fn()
-                do = torch.randn_like(o)
-                fn = lambda: o.backward(do, retain_graph=True)
-
-        elif "torch" in provider and args.layout in ["thd", "bhsd", "bshd"]:
-            # torch requires the layout to be (b (optional),...,h,s,d)
-            if args.layout in ["thd", "bshd"]:
-                q = q.transpose(-3, -2)
-                k = k.transpose(-3, -2)
-                v = v.transpose(-3, -2)
-            # check if GQA
-            HQ = q.shape[-3]
-            HK = k.shape[-3]
-            if HQ != HK:  # TODO: sdpa(..., enable_gqa=True work) should work
-                k = k.repeat_interleave(q.size(-3) // k.size(-3), -3)
-                v = v.repeat_interleave(q.size(-3) // v.size(-3), -3)
-
-            fn = lambda: torch.nn.functional.scaled_dot_product_attention(
-                q, k, v, attn_mask=None, dropout_p=0.0, is_causal=causal, scale=input_metadata.sm_scale)
-        else:
-            assert False, f"Unknown provider {provider} in flash-attention."
+        # Only triton provider is supported
+        assert "triton" in provider, f"Only triton provider is supported, got {provider}"
+        o = torch.empty_like(q)
+        if int8_val:
+            q, k, v = quantize_input(q, k, v, input_metadata, quantize_p=quantize_p_val, int8_kv=int8_kv_val)
+        input_metadata.set_persistent(persistent)
+        fn = lambda: attention(q, k, v, o, input_metadata)
+        if mode == 'bwd':
+            o, _, _ = fn()
+            do = torch.randn_like(o)
+            fn = lambda: o.backward(do, retain_graph=True)
 
         ms = triton.testing.do_bench(fn, warmup=warmup, rep=rep)
+        us = ms * 1000  # Convert milliseconds to microseconds
         total_flops = 2 * flops_per_matmul
         if mode == "bwd":
             total_flops *= 2.5  # 2.0(bwd) + 0.5(recompute)
+        tflop = total_flops / ms * 1e-9
+        
+        # Store results for return
+        benchmark_results.append({'us': us, 'tflop': tflop})
+        
         if print_time:
-            return ms
+            return us
         else:
-            return total_flops / ms * 1e-9
+            return tflop
 
     bench_flash_attention.run(print_data=True)
+    
+    # Return the results (last result if multiple benchmarks)
+    if benchmark_results:
+        last_result = benchmark_results[-1]
+        return last_result['tflop'], last_result['us']
+    else:
+        return None, None
 
 
 def supported_layouts():
@@ -2142,28 +2146,100 @@ arg_to_torch_dtype = {'fp16': torch.float16, 'bf16': torch.bfloat16, 'fp32': tor
 
 
 def main():
-    args = parse_args()
-    custom_config = False
-    assert args.layout == 'thd' or not args.equal_seqlens or args.model, \
-           "Equal sequence lengths arg must be used with the thd layout or a model config."
-    if args.hq or args.hk or args.d:
-        custom_config = True
-        assert args.b and args.hq and args.sq and args.d, \
-               "If custom config is specified, please provide \
-                all of batch, number of Q heads, Q sequence length \
-                and head size."
-
-    if args.model:
-        assert not (args.hq or args.hk or args.d), \
-                "Specifying model fixes hq, hk and d already. Do not provide them!"
-
-    assert args.dtype in arg_to_torch_dtype, \
-           "Only fp16, bf16 and f32 types currently supported."
-
-    if args.model:
-        print("Note: Model config sets causal masking and THD layout (varlen) by default.")
-
-    run_benchmark(custom_config, args)
+    # Otherwise, loop over all parameter combinations
+    batches = [2, 8, 16]
+    num_heads_configs = [("16", "16"), ("16", "2")]  # (num_heads_q, num_heads_kv)
+    seq_lengths = [512, 1024, 4096]
+    head_sizes = [64, 128]
+    attn_types = ["noop", "causal"]
+    
+    # Store all results
+    all_results = []
+    
+    # Open CSV file for writing results in order
+    csv_filename = "benchmark_results.csv"
+    with open(csv_filename, 'w', newline='') as csvfile:
+        csv_writer = csv.writer(csvfile)
+        # Write header row
+        csv_writer.writerow(['attn_type', 'shape', 'fwd_time_us', 'TFLOPs'])
+    
+    print("Running benchmarks over all parameter combinations...")
+    print(f"Total combinations: {len(batches) * len(num_heads_configs) * len(seq_lengths) * len(head_sizes) * len(attn_types)}")
+    print(f"Results will be saved to {csv_filename}")
+    
+    for batch in batches:
+        for hq_str, hk_str in num_heads_configs:
+            hq = int(hq_str)
+            hk = int(hk_str)
+            for seq_len in seq_lengths:
+                for head_size in head_sizes:
+                    for attn_type in attn_types:
+                        print(f"\nRunning: batch={batch}, hq={hq}, hk={hk}, seq_len={seq_len}, head_size={head_size}, attn_type={attn_type}")
+                        
+                        try:
+                            tflop, us = run_benchmark(
+                                custom=True,
+                                b=batch,
+                                hq=hq,
+                                hk=hk,
+                                sq=seq_len,
+                                sk=seq_len,  # Use same seq_len for Q and K
+                                d=head_size,
+                                attn_type=attn_type,
+                                dtype='fp16',
+                                layout='bhsd',
+                                return_time=False,
+                                int8=False,
+                                quantize_p=False,
+                                int8_kv=False,
+                                persistent=None,
+                                equal_seqlens=False,
+                                model=None,
+                                model_configs="model_configs.json"
+                            )
+                            if tflop is not None and us is not None:
+                                result = {
+                                    'batch': batch,
+                                    'hq': hq,
+                                    'hk': hk,
+                                    'seq_len': seq_len,
+                                    'head_size': head_size,
+                                    'attn_type': attn_type,
+                                    'tflop': tflop,
+                                    'us': us
+                                }
+                                all_results.append(result)
+                                
+                                # Format shape as (B, hq, M, Hkv, N, D)
+                                # where M=seqlen_q, N=seqlen_kv, D=head_size
+                                shape_str = f"({batch}, {hq}, {seq_len}, {hk}, {seq_len}, {head_size})"
+                                
+                                # Write to CSV file in order
+                                with open(csv_filename, 'a', newline='') as csvfile:
+                                    csv_writer = csv.writer(csvfile)
+                                    csv_writer.writerow([attn_type, shape_str, f"{us:.4f}", f"{tflop:.4f}"])
+                                
+                                print(f"  Result: tflop={tflop:.4f}, us={us:.4f}")
+                            else:
+                                print(f"  Warning: No results returned (tflop={tflop}, us={us})")
+                        except Exception as e:
+                            print(f"  Error: {e}")
+                            import traceback
+                            traceback.print_exc()
+                            continue
+    
+    # Print summary
+    print("\n" + "="*80)
+    print("SUMMARY OF ALL BENCHMARKS")
+    print("="*80)
+    for result in all_results:
+        attn_type_str = str(result['attn_type'])
+        print(f"batch={result['batch']:2d}, hq={result['hq']:2d}, hk={result['hk']:2d}, "
+              f"seq_len={result['seq_len']:5d}, head_size={result['head_size']:3d}, "
+              f"attn_type={attn_type_str:5s}, tflop={result['tflop']:.4f}, us={result['us']:.4f}")
+    
+    print(f"\nCSV results saved to {csv_filename}")
+    return all_results
 
 
 if __name__ == '__main__':
