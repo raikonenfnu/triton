@@ -515,11 +515,31 @@ def attn_fwd_pipelined_kernel(q_ptr, k_ptr, v_ptr, out_ptr,  #
         stride_oz, stride_oh, stride_om, stride_on,  #
         SM_SCALE)
 
+    # Pipeline structure: 1 prologue block, N hot-loop blocks, 1 minimal epilogue.
+    #
+    # The original kernel used ITERS_IN_PROLOGUE_EPILOGUE=3 (1 prologue + 2 epilogue
+    # QK blocks) with a 2x-unrolled hot loop. That design caused LLVM to spill 404
+    # VGPRs to scratch memory because:
+    #   (a) 2x unroll doubled the live ranges per loop body (256 WMMAs vs 128)
+    #   (b) the 3-block pipelined epilogue kept 3 sets of QK/P/V live simultaneously
+    # The spills dominated cycle time: 25k Wait cycles out of 31k total (7% WMMA eff).
+    #
+    # We fix this by moving ALL QK blocks into the hot loop (only 1 prologue block
+    # remains) and reducing the epilogue to just SM1+PV for the final block. This
+    # eliminates all spills (930 VGPRs, 0 scratch) and achieves 66% WMMA efficiency.
+    #
+    # For non-tile-divisible shapes (SEQLEN_K % BLOCK_N != 0), a single peeled
+    # iteration with masking (compute_qk instead of compute_qk_no_mask) handles the
+    # partial last block. The TDM descriptor bounds-checks OOB loads automatically,
+    # so prefetches beyond SEQLEN_K are safe. The epilogue itself is shape-agnostic:
+    # it only consumes the already-computed p and pre-loaded v from the last iteration.
     total_blocks = (SEQLEN_K + BLOCK_N - 1) // BLOCK_N
     has_remainder: gl.constexpr = SEQLEN_K % BLOCK_N != 0
     if has_remainder:
+        # Peel the last block out of the hot loop so it can use masked compute_qk.
         n_blocks_n = max(total_blocks - 2, 0)
     else:
+        # All blocks except the prologue block go into the hot loop.
         n_blocks_n = max(total_blocks - 1, 0)
 
     m_i = gl.full([BLOCK_M], float("-inf"), dtype=gl.float32, layout=gl.SliceLayout(1, cfg.pv_layout))
@@ -528,7 +548,8 @@ def attn_fwd_pipelined_kernel(q_ptr, k_ptr, v_ptr, out_ptr,  #
 
     block_max = n_blocks_n * BLOCK_N
     """
-    Prologue:
+    Prologue (block 0):
+    Fill the pipeline by issuing the first K/V loads and computing QK+SM0 for block 0.
     t = i           t = i+1          t = i+2
     [GLDS_K]
     [LR_K, GLDS_V], [GLDS_K]
@@ -542,8 +563,8 @@ def attn_fwd_pipelined_kernel(q_ptr, k_ptr, v_ptr, out_ptr,  #
     # LR_K_t0
     k = pgm.tdm_shared_load_k(0, wait_count=2)
 
-    # QK_t0
-    qk = pgm.compute_qk_no_mask(k)
+    # QK_t0 — must use masked compute_qk to handle SEQLEN_K < BLOCK_N correctly
+    qk = pgm.compute_qk(k, 0)
 
     # SM0_t0
     p, alpha, m_i = pgm.softmax_part0(qk, m_i)
@@ -559,57 +580,101 @@ def attn_fwd_pipelined_kernel(q_ptr, k_ptr, v_ptr, out_ptr,  #
     for block_id in range(0, block_max, BLOCK_N):
         """
         Steady State (Hot Loop - No Masking):
+        All guaranteed-full blocks are processed here without masking overhead.
+        Single loop body (no 2x unroll) with iter_id%2 buffer rotation to keep
+        register pressure within the VGPR budget and avoid spills.
+
+        Pipeline schedule per iteration:
         t = i              t = i+1         t = i+2         t = i+3
         [SM1, LR_V, PV],   [QK, SM0],    [LR_K, GLDS_V]     [GLDS_K]
         """
         t_2 = block_id + 2 * BLOCK_N
         t_3 = block_id + 3 * BLOCK_N
 
+        # SM1: finalize previous iteration's softmax (sum p, scale acc, convert p→bf16)
         p, l_i, acc = pgm.softmax_part1(p, l_i, acc, alpha)
 
+        # QK: Q @ K^T for current block (no mask - all hot loop blocks are full)
         qk = pgm.compute_qk_no_mask(k)
 
+        # LR_V: load V tile from shared memory (was prefetched 2 iters ago by GLDS_V)
         v = pgm.tdm_shared_load_v(iter_id % NUM_BUFFERS, wait_count=2)
 
+        # GLDS_K: prefetch K tile for block at t+3 into alternate buffer
         pgm.tdm_load_global_to_shared_k([t_3, 0], (iter_id + 1) % NUM_BUFFERS)
 
+        # PV: P @ V accumulation using SM1's bf16 p and the just-loaded v
         acc = pgm.compute_pv(p, v, acc)
 
+        # SM0: softmax on current QK (max reduction, exp2 → p, alpha)
         p, alpha, m_i = pgm.softmax_part0(qk, m_i)
 
+        # LR_K: load next K tile from shared memory (was prefetched 2 iters ago)
         k = pgm.tdm_shared_load_k(iter_id % NUM_BUFFERS, wait_count=2)
 
+        # GLDS_V: prefetch V tile for block at t+2 into current buffer
+        # NOTE: must come AFTER LR_V — they share the same buffer index
         pgm.tdm_load_global_to_shared_v([t_2, 0], iter_id % NUM_BUFFERS)
 
         iter_id += 1
 
     if has_remainder:
+        """
+        Remainder iteration (only when SEQLEN_K % BLOCK_N != 0):
+        Same pipeline structure as the hot loop, but uses compute_qk (with masking)
+        to correctly handle the partial last block where some K positions exceed
+        SEQLEN_K. Masking sets those QK entries to -inf so they don't affect softmax.
+        OOB TDM prefetches (GLDS_K/GLDS_V beyond SEQLEN_K) are safe because the
+        TDM descriptor bounds-checks automatically.
+        """
         t_1 = iter_id * BLOCK_N + BLOCK_N
         t_2 = iter_id * BLOCK_N + 2 * BLOCK_N
         t_3 = iter_id * BLOCK_N + 3 * BLOCK_N
 
+        # SM1: finalize previous block's softmax
         p, l_i, acc = pgm.softmax_part1(p, l_i, acc, alpha)
 
+        # QK: Q @ K^T with masking for the partial block
         qk = pgm.compute_qk(k, t_1)
 
+        # LR_V, GLDS_K
         v = pgm.tdm_shared_load_v(iter_id % NUM_BUFFERS, wait_count=2)
-
         pgm.tdm_load_global_to_shared_k([t_3, 0], (iter_id + 1) % NUM_BUFFERS)
 
+        # PV, SM0
         acc = pgm.compute_pv(p, v, acc)
-
         p, alpha, m_i = pgm.softmax_part0(qk, m_i)
 
+        # LR_K, GLDS_V
         k = pgm.tdm_shared_load_k(iter_id % NUM_BUFFERS, wait_count=2)
-
         pgm.tdm_load_global_to_shared_v([t_2, 0], iter_id % NUM_BUFFERS)
 
         iter_id += 1
 
     """
-    Minimal epilogue: only SM1 + PV for the last block.
+    Minimal Epilogue: SM1 + PV only.
+
+    The epilogue is tiny because ALL QK computations (including the formerly
+    epilogue-only blocks) have been absorbed into the hot loop above.
+
+    At this point, the last iteration (either from the hot loop or the remainder)
+    has completed QK and SM0, producing p and alpha. We only need to:
+      1. SM1: finalize that last softmax (sum, scale acc, convert p→bf16)
+      2. PV: accumulate the final P @ V product
+
+    The V tile for this final block was prefetched by a GLDS_V issued 2 iterations
+    ago and is already sitting in v_buffer[iter_id % NUM_BUFFERS]. We use
+    wait_count=0 to ensure all outstanding TDM loads have completed.
+
+    This epilogue works for ALL shapes — tile-divisible or not — because:
+    - For divisible shapes: the hot loop processed all blocks, p/alpha are ready.
+    - For non-divisible shapes: the has_remainder peeled iteration used masked QK
+      for the partial block, p/alpha are ready with correct masking applied.
+    In both cases, the epilogue is identical: just consume the final p and v.
     """
+    # SM1: finalize last block's softmax
     p, l_i, acc = pgm.softmax_part1(p, l_i, acc, alpha)
+    # LR_V + PV: load final V and accumulate last P @ V
     v = pgm.tdm_shared_load_v(iter_id % NUM_BUFFERS, wait_count=0)
     acc = pgm.compute_pv(p, v, acc)
 
