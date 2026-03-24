@@ -515,154 +515,52 @@ def attn_fwd_pipelined_kernel(q_ptr, k_ptr, v_ptr, out_ptr,  #
         stride_oz, stride_oh, stride_om, stride_on,  #
         SM_SCALE)
 
-    ITERS_IN_PROLOGUE_EPILOGUE: gl.constexpr = 3
-    n_blocks_n = max((SEQLEN_K + BLOCK_N - 1) // BLOCK_N - ITERS_IN_PROLOGUE_EPILOGUE, 1)
-
-    # Since QK from the final iteration is already peeled into the epilogue,
-    # we only need to handle case where SEQLEN_K < ITERS_IN_PROLOGUE_EPILOGUE * BLOCK_N.
-    has_remainder: gl.constexpr = SEQLEN_K < (ITERS_IN_PROLOGUE_EPILOGUE) * BLOCK_N
-    REMAINDER_PEELED_ITERS = 1
-    if has_remainder:
-        n_blocks_n = n_blocks_n - REMAINDER_PEELED_ITERS
+    n_blocks_n = max((SEQLEN_K + BLOCK_N - 1) // BLOCK_N - 1, 0)
 
     m_i = gl.full([BLOCK_M], float("-inf"), dtype=gl.float32, layout=gl.SliceLayout(1, cfg.pv_layout))
     l_i = gl.full([BLOCK_M], 1.0, dtype=gl.float32, layout=gl.SliceLayout(1, cfg.pv_layout))
     acc = gl.zeros([BLOCK_M, HEAD_SZ], dtype=gl.float32, layout=cfg.pv_layout)
 
-    block_min = 0
     block_max = n_blocks_n * BLOCK_N
     """
-    Prologue:
-    t = i           t = i+1          t = i+2
-    [GLDS_K]
-    [LR_K, GLDS_V], [GLDS_K]
-    [QK, SM0],      [LR_K, GLDS_V],  [GLDS_K]
+    Shallow pipeline (depth-1) to avoid epilogue spills.
+    Prologue: GLDS_K[0], wait, QK[0], SM0[0], then prefetch V[0] and K[1].
+    Hot loop: SM1+PV for block i, then LR_K+QK+SM0 for block i+1, then prefetch V[i+1] and K[i+2].
+    Epilogue: SM1+PV for last block only (no extra QK blocks).
     """
-    # GLDS_K_t0, GLDS_K_t1, GLDS_V_t0
+    # Prologue: process block 0
     pgm.tdm_load_global_to_shared_k([0, 0], buffer_index=0)
-    pgm.tdm_load_global_to_shared_k([BLOCK_N, 0], buffer_index=1)
-    pgm.tdm_load_global_to_shared_v([0, 0], buffer_index=0)
-
-    # LR_K_t0
-    k = pgm.tdm_shared_load_k(0, wait_count=2)
-
-    # QK_t0
+    k = pgm.tdm_shared_load_k(0, wait_count=0)
     qk = pgm.compute_qk(k, 0)
-
-    # SM0_t0
     p, alpha, m_i = pgm.softmax_part0(qk, m_i)
 
-    # GLDS_V_t1, GLDS_K_t2
-    pgm.tdm_load_global_to_shared_v([BLOCK_N, 0], buffer_index=1)
-    pgm.tdm_load_global_to_shared_k([2 * BLOCK_N, 0], buffer_index=0)
-
-    # LR_K_t1
-    k = pgm.tdm_shared_load_k(1, wait_count=3)
+    pgm.tdm_load_global_to_shared_v([0, 0], buffer_index=0)
+    pgm.tdm_load_global_to_shared_k([BLOCK_N, 0], buffer_index=1)
 
     iter_id = 0
-    for block_id in range(block_min, block_max, BLOCK_N):
+    for block_id in range(0, block_max, BLOCK_N):
         """
-        Steady State (Hot Loop - No Masking):
-        t = i              t = i+1         t = i+2         t = i+3
-        [SM1, LR_V, PV],   [QK, SM0],    [LR_K, GLDS_V]     [GLDS_K]
+        Each iteration finishes block i (SM1+PV) and prepares block i+1 (QK+SM0).
+        TDM FIFO order: [V_prev, K_curr] — wait_count=1 drains V, wait_count=0 drains K.
         """
-        t_1 = block_id + BLOCK_N
-        t_2 = block_id + 2 * BLOCK_N
-        t_3 = block_id + 3 * BLOCK_N
-
-        # QK, SM1, LR_V (no mask needed - all blocks in hot loop are full)
-        qk = pgm.compute_qk_no_mask(k)
+        cur_block = block_id + BLOCK_N
 
         p, l_i, acc = pgm.softmax_part1(p, l_i, acc, alpha)
-
-        v = pgm.tdm_shared_load_v(iter_id % NUM_BUFFERS, wait_count=2)
-
-        # GLDS_K
-        pgm.tdm_load_global_to_shared_k([t_3, 0], (iter_id + 1) % NUM_BUFFERS)
-
-        # PV, SM0, LR_K
+        v = pgm.tdm_shared_load_v(iter_id % NUM_BUFFERS, wait_count=1)
         acc = pgm.compute_pv(p, v, acc)
 
+        k = pgm.tdm_shared_load_k((iter_id + 1) % NUM_BUFFERS, wait_count=0)
+        qk = pgm.compute_qk(k, cur_block)
         p, alpha, m_i = pgm.softmax_part0(qk, m_i)
 
-        k = pgm.tdm_shared_load_k(iter_id % NUM_BUFFERS, wait_count=2)
-
-        # GLDS_V
-        pgm.tdm_load_global_to_shared_v([t_2, 0], iter_id % NUM_BUFFERS)
+        pgm.tdm_load_global_to_shared_v([cur_block, 0], (iter_id + 1) % NUM_BUFFERS)
+        pgm.tdm_load_global_to_shared_k([cur_block + BLOCK_N, 0], iter_id % NUM_BUFFERS)
         iter_id += 1
-    """
-    Final iteration of steady state that requires masking.(if masking is required)
-    """
-    if has_remainder:
-        t_1 = iter_id * BLOCK_N + BLOCK_N
-        t_2 = iter_id * BLOCK_N + 2 * BLOCK_N
-        t_3 = iter_id * BLOCK_N + 3 * BLOCK_N
 
-        # Process the remainder block with masking
-        qk = pgm.compute_qk(k, t_1)
-
-        p, l_i, acc = pgm.softmax_part1(p, l_i, acc, alpha)
-
-        v = pgm.tdm_shared_load_v(iter_id % NUM_BUFFERS, wait_count=2)
-
-        # GLDS_K
-        pgm.tdm_load_global_to_shared_k([t_3, 0], (iter_id + 1) % NUM_BUFFERS)
-
-        # PV, SM0, LR_K
-        acc = pgm.compute_pv(p, v, acc)
-
-        p, alpha, m_i = pgm.softmax_part0(qk, m_i)
-
-        k = pgm.tdm_shared_load_k(iter_id % NUM_BUFFERS, wait_count=2)
-
-        # GLDS_V
-        pgm.tdm_load_global_to_shared_v([t_2, 0], iter_id % NUM_BUFFERS)
-        iter_id += 1
-    """
-    Epilogue:
-    t = i+1              t = i+2              t = i+3
-    [SM1, LR_V, PV],    [QK, SM0],          [LR_K, GLDS_V]
-                        [SM1, LR_V, PV],    [QK, SM0]
-                                            [SM1, LR_V, PV]
-    """
-    epilogue_offset = (iter_id - 1) * BLOCK_N
-    t_2 = epilogue_offset + 2 * BLOCK_N
-    t_3 = epilogue_offset + 3 * BLOCK_N
-    # SM1_t1, LR_V_t1, PV_t1
+    # Epilogue: finish last block (SM1 + PV only — no extra QK blocks)
     p, l_i, acc = pgm.softmax_part1(p, l_i, acc, alpha)
-
-    v = pgm.tdm_shared_load_v(iter_id % NUM_BUFFERS, wait_count=2)
-
-    acc = pgm.compute_pv(p, v, acc)
-
-    # QK_t2, SM0_t2
-    qk = pgm.compute_qk(k, t_2)
-    p, alpha, m_i = pgm.softmax_part0(qk, m_i)
-
-    # LR_K_t3, GLDS_V_t3
-    k = pgm.tdm_shared_load_k(iter_id % NUM_BUFFERS, wait_count=1)
-
-    pgm.tdm_load_global_to_shared_v([t_3, 0], iter_id % NUM_BUFFERS)
-
-    # QK_t3, SM1_t2, LR_V_t2
-    qk = pgm.compute_qk(k, t_3)
-
-    p, l_i, acc = pgm.softmax_part1(p, l_i, acc, alpha)
-
-    v = pgm.tdm_shared_load_v((iter_id + 1) % NUM_BUFFERS, wait_count=1)
-
-    # PV_t_2, SM0_t_3, SM1_t_3, LR_V_t3
-    acc = pgm.compute_pv(p, v, acc)
-
-    p, alpha, m_i = pgm.softmax_part0(qk, m_i)
-    p, l_i, acc = pgm.softmax_part1(p, l_i, acc, alpha)
-
     v = pgm.tdm_shared_load_v(iter_id % NUM_BUFFERS, wait_count=0)
-
-    # PV_t_3
     acc = pgm.compute_pv(p, v, acc)
-
-    # Post loop scaling and output
 
     l_recip = 1 / l_i[:, None]
     acc = acc * l_recip
