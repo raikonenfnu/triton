@@ -100,3 +100,10 @@ private:
     return builder->getUnknownLoc();
   }
 };
+
+// TLX addition: expose builder class for TLX dialect Python bindings
+#include <pybind11/pybind11.h>
+namespace py = pybind11;
+namespace ir {
+extern py::class_<TritonOpBuilder> *getBuilderClass();
+} // namespace ir
