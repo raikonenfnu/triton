@@ -296,7 +296,10 @@ class HIPBackend(BaseBackend):
             )
             amd.passes.ttgpuir.add_optimize_buffer_op_ptr(pm)
 
-        amd.passes.ttgpuir.add_fold_true_cmpi(pm)
+        # fold_true_cmpi is disabled: it folds tl.assume conditions (e.g.
+        # stride > 0) to %true, destroying information LLVM uses to optimize
+        # buffer load/store address arithmetic and register allocation.
+        # amd.passes.ttgpuir.add_fold_true_cmpi(pm)
         amd.passes.ttgpuir.add_prepare_if_combining(pm)
         passes.common.add_canonicalizer(pm)
         passes.common.add_cse(pm)
