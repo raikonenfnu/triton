@@ -44,7 +44,7 @@ class HIPOptions:
     num_ctas: int = 1
     extern_libs: dict = None
     debug: bool = False
-    sanitize_overflow: bool = True
+    sanitize_overflow: bool = False
     arch: str = None
     # We have native support for OCP fp8 variants since CDNA4/RDNA4. For earlier generations,
     # we software emulate the support for them.
@@ -250,6 +250,7 @@ class HIPBackend(BaseBackend):
         amd.passes.ttgpuir.add_accelerate_matmul(pm, options.arch, options.matrix_instr_nonkdim, options.kpack)
         tlx.tlx_passes.add_tlx_insert_require_layout(pm)
         tlx.tlx_passes.add_tlx_propagate_layout(pm)
+        tlx.tlx_passes.add_tlx_rewrite_local_alias(pm)
 
         passes.ttgpuir.add_remove_layout_conversions(pm)
         amd.passes.ttgpuir.add_optimize_epilogue(pm)
@@ -279,6 +280,7 @@ class HIPBackend(BaseBackend):
         if is_in_thread_transpose_enabled(options.arch):
             amd.passes.ttgpuir.add_in_thread_transpose(pm)
             passes.ttgpuir.add_remove_layout_conversions(pm)
+        passes.ttgpuir.add_reorder_instructions(pm)
         amd.passes.ttgpuir.add_move_up_prologue_loads(pm)
         if use_block_pingpong and options.num_stages > 1:
             amd.passes.ttgpuir.add_block_pingpong(pm, options.num_stages)
