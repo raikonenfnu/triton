@@ -133,3 +133,72 @@
 2. **Add warp specialization to TLX**: Support `async_task` for producer/consumer overlap (requires TLX-AMD backend work)
 3. **Explore BLOCK_M=256**: FAv3 uses larger M blocks; test if this helps with 4 warps
 4. **Add `sched_barrier` / `s_setprio` intrinsics**: Enable fine-grained scheduling control in TLX
+
+---
+
+## Run: 2026-04-14T05:19:39.401601
+
+
+### ✓ All correctness checks passed
+
+
+### Correctness — Benchmark-scale (B=1 H=64 N=16384 D=128)
+
+| Kernel | Ref | Status | max_err | mean_err |
+|--------|-----|--------|---------|----------|
+| Vanilla | SDPA | ✅ PASS | 0.000244 | 0.000000 |
+| RegPipelined | SDPA | ✅ PASS | 0.000244 | 0.000000 |
+
+### Benchmark — B=1 H=64 N=16384 D=128 causal=False bf16
+
+| Provider | Time (ms) | TFLOPS |
+|----------|-----------|--------|
+| Torch SDPA | 13.442 | 654.39 |
+| TLX Vanilla | 13.074 | 672.82 |
+| TLX RegPipelined | 22.776 | 386.20 |
+
+---
+
+## Run: 2026-04-14T07:42:22.120645
+
+
+### ✓ All correctness checks passed
+
+
+### Correctness — Benchmark-scale (B=1 H=64 N=16384 D=128)
+
+| Kernel | Ref | Status | max_err | mean_err |
+|--------|-----|--------|---------|----------|
+| Vanilla | SDPA | ✅ PASS | 0.000244 | 0.000000 |
+| RegPipelined | SDPA | ✅ PASS | 0.000244 | 0.000000 |
+
+### Benchmark — B=1 H=64 N=16384 D=128 causal=False bf16
+
+| Provider | Time (ms) | TFLOPS |
+|----------|-----------|--------|
+| Torch SDPA | 13.457 | 653.64 |
+| TLX Vanilla | 13.075 | 672.72 |
+| TLX RegPipelined | 22.777 | 386.19 |
+
+---
+
+## Run: 2026-04-14T08:33:23.583517
+
+
+### ✓ All correctness checks passed
+
+
+### Correctness — Benchmark-scale (B=1 H=64 N=16384 D=128)
+
+| Kernel | Ref | Status | max_err | mean_err |
+|--------|-----|--------|---------|----------|
+| Vanilla | SDPA | ✅ PASS | 0.000244 | 0.000000 |
+| RegPipelined | SDPA | ✅ PASS | 0.000244 | 0.000000 |
+
+### Benchmark — B=1 H=64 N=16384 D=128 causal=False bf16
+
+| Provider | Time (ms) | TFLOPS |
+|----------|-----------|--------|
+| Torch SDPA | 13.451 | 653.93 |
+| TLX Vanilla | 13.066 | 673.19 |
+| TLX RegPipelined | 22.760 | 386.46 |
