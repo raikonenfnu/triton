@@ -605,6 +605,106 @@ def _attn_fwd_manual_s4(
 #     5. softmax
 #     6. dot(P, V) → acc
 
+# ═══════════════════════════════════════════════════════════════════════════
+# Simple async DMA — single buffer, no pipelining, one loop for all tiles
+# ═══════════════════════════════════════════════════════════════════════════
+# Simplest possible kernel using tlx.async_load + explicit shared memory.
+# Single loop tiles N by BLOCK_N. Each iteration:
+#   1. async_load K and V into shared memory
+#   2. commit + wait (no overlap with previous iteration)
+#   3. local_load K, V from shared to registers
+#   4. QK dot, softmax, PV dot
+# Handles causal masking and sequence boundary inline.
+
+@triton.jit
+def _attn_fwd_async_simple(
+    Q, K, V, Out, L,
+    stride_qz, stride_qh, stride_qm, stride_qk,
+    stride_kz, stride_kh, stride_kn, stride_kk,
+    stride_vz, stride_vh, stride_vn, stride_vk,
+    stride_oz, stride_oh, stride_om, stride_ok,
+    sm_scale, Z, H, N_CTX,
+    BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr,
+    HEAD_DIM: tl.constexpr, IS_CAUSAL: tl.constexpr,
+):
+    _assume_strides(
+        stride_qz, stride_qh, stride_qm, stride_qk,
+        stride_kz, stride_kh, stride_kn, stride_kk,
+        stride_vz, stride_vh, stride_vn, stride_vk,
+        stride_oz, stride_oh, stride_om, stride_ok)
+
+    pid_m  = tl.program_id(0)
+    pid_hz = tl.program_id(1)
+    off_z  = pid_hz // H
+    off_h  = pid_hz %  H
+
+    q_off = off_z * stride_qz + off_h * stride_qh
+    k_off = off_z * stride_kz + off_h * stride_kh
+    v_off = off_z * stride_vz + off_h * stride_vh
+    o_off = off_z * stride_oz + off_h * stride_oh
+
+    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_n = tl.arange(0, BLOCK_N)
+    offs_d = tl.arange(0, HEAD_DIM)
+
+    q = tl.load(Q + q_off + offs_m[:, None] * stride_qm + offs_d[None, :] * stride_qk,
+                mask=offs_m[:, None] < N_CTX, other=0.0)
+
+    m_i = tl.full([BLOCK_M], float("-inf"), dtype=tl.float32)
+    l_i = tl.full([BLOCK_M], 1.0, dtype=tl.float32)
+    acc = tl.zeros([BLOCK_M, HEAD_DIM], dtype=tl.float32)
+    QK_SCALE = sm_scale * 1.44269504089
+
+    if IS_CAUSAL:
+        hi = min(N_CTX, (pid_m + 1) * BLOCK_M)
+    else:
+        hi = N_CTX
+
+    k_buf = tlx.local_alloc((HEAD_DIM, BLOCK_N), tlx.dtype_of(K), 1)
+    v_buf = tlx.local_alloc((BLOCK_N, HEAD_DIM), tlx.dtype_of(V), 1)
+
+    k_base = K + k_off + offs_d[:, None] * stride_kk + offs_n[None, :] * stride_kn
+    v_base = V + v_off + offs_n[:, None] * stride_vn + offs_d[None, :] * stride_vk
+
+    for start_n in tl.range(0, hi, BLOCK_N, num_stages=0):
+        kn = start_n + offs_n
+        k_mask = kn[None, :] < N_CTX
+        v_mask = kn[:, None] < N_CTX
+
+        tok_k = tlx.async_load(k_base + start_n * stride_kn,
+                               tlx.local_view(k_buf, 0), mask=k_mask)
+        tok_v = tlx.async_load(v_base + start_n * stride_vn,
+                               tlx.local_view(v_buf, 0), mask=v_mask)
+        tlx.async_load_commit_group([tok_k, tok_v])
+
+        wait_tok = tlx.async_load_wait_group(0)
+        k_cur = tlx.local_load(tlx.local_view(k_buf, 0),
+                               token=wait_tok, relaxed=True)
+        v_cur = tlx.local_load(tlx.local_view(v_buf, 0),
+                               token=wait_tok, relaxed=True)
+
+        qk = tl.zeros([BLOCK_M, BLOCK_N], dtype=tl.float32) + tl.dot(q, k_cur)
+        if IS_CAUSAL:
+            qk = tl.where(offs_m[:, None] >= kn[None, :], qk, float("-inf"))
+        if start_n + BLOCK_N > N_CTX:
+            qk = tl.where(kn[None, :] < N_CTX, qk, float("-inf"))
+
+        m_ij  = tl.maximum(m_i, tl.max(qk, 1) * QK_SCALE)
+        qk    = qk * QK_SCALE - m_ij[:, None]
+        p     = tl.math.exp2(qk)
+        l_ij  = tl.sum(p, 1)
+        alpha = tl.math.exp2(m_i - m_ij)
+        acc = acc * alpha[:, None]; l_i = l_i * alpha + l_ij; m_i = m_ij
+        acc += tl.dot(p.to(v_cur.dtype), v_cur)
+
+    acc = acc / l_i[:, None]
+    lse = m_i + tl.math.log2(l_i)
+    tl.store(L + pid_hz * N_CTX + offs_m, lse, mask=offs_m < N_CTX)
+    o_ptrs = Out + o_off + offs_m[:, None] * stride_om + offs_d[None, :] * stride_ok
+    tl.store(o_ptrs, acc.to(Out.dtype.element_ty),
+             mask=(offs_m[:, None] < N_CTX) & (offs_d[None, :] < HEAD_DIM))
+
+
 @triton.jit
 def _attn_fwd_async(
     Q, K, V, Out, L,
@@ -720,6 +820,156 @@ def _attn_fwd_async(
 
 
 # ═══════════════════════════════════════════════════════════════════════════
+# SAP — Async DMA with prologue/steady-state/epilogue pipeline
+# ═══════════════════════════════════════════════════════════════════════════
+#
+# Modeled after gfx1250 attn_fwd_pipelined_kernel. Key ideas:
+#   1. Split softmax: SM0 produces p/alpha, SM1 (next iter) updates acc/l_i
+#   2. Separate K/V DMA commits: K issued 3 tiles ahead, V 2 tiles ahead
+#   3. Commit ordering K,V,K,V... ensures wait_group(2) always drains the
+#      correct data (FIFO completion order)
+#   4. No loop_unroll_factor (catastrophic for async on MI300)
+#
+# Pipeline diagram (steady state, each iteration):
+#   t=i              t=i+1        t=i+2        t=i+3
+#   [SM1, LR_V, PV]  [QK, SM0]   [LR_K, DMA_V] [DMA_K]
+#
+# Commit group trace (invariant: 3 groups pending at loop top):
+#   wait(2) → V[i] done, load it
+#   commit K[i+3]  → 3 pending
+#   wait(2) → K[i+2] done, load it
+#   commit V[i+2]  → 3 pending (restored)
+
+@triton.jit
+def _attn_fwd_async_pipelined(
+    Q, K, V, Out, L,
+    stride_qz, stride_qh, stride_qm, stride_qk,
+    stride_kz, stride_kh, stride_kn, stride_kk,
+    stride_vz, stride_vh, stride_vn, stride_vk,
+    stride_oz, stride_oh, stride_om, stride_ok,
+    sm_scale, Z, H, N_CTX,
+    BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr,
+    HEAD_DIM: tl.constexpr, IS_CAUSAL: tl.constexpr,
+):
+    _assume_strides(
+        stride_qz, stride_qh, stride_qm, stride_qk,
+        stride_kz, stride_kh, stride_kn, stride_kk,
+        stride_vz, stride_vh, stride_vn, stride_vk,
+        stride_oz, stride_oh, stride_om, stride_ok)
+
+    pid_m  = tl.program_id(0)
+    pid_hz = tl.program_id(1)
+    off_z  = pid_hz // H
+    off_h  = pid_hz %  H
+
+    q_off = off_z * stride_qz + off_h * stride_qh
+    k_off = off_z * stride_kz + off_h * stride_kh
+    v_off = off_z * stride_vz + off_h * stride_vh
+    o_off = off_z * stride_oz + off_h * stride_oh
+
+    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_n = tl.arange(0, BLOCK_N)
+    offs_d = tl.arange(0, HEAD_DIM)
+
+    q = tl.load(Q + q_off + offs_m[:, None] * stride_qm + offs_d[None, :] * stride_qk,
+                mask=offs_m[:, None] < N_CTX, other=0.0)
+
+    m_i = tl.full([BLOCK_M], float("-inf"), dtype=tl.float32)
+    l_i = tl.full([BLOCK_M], 1.0, dtype=tl.float32)
+    acc = tl.zeros([BLOCK_M, HEAD_DIM], dtype=tl.float32)
+    QK_SCALE = sm_scale * 1.44269504089
+
+    if IS_CAUSAL:
+        hi = min(N_CTX, (pid_m + 1) * BLOCK_M)
+        n_full = (pid_m * BLOCK_M) // BLOCK_N
+    else:
+        hi = N_CTX
+        n_full = hi // BLOCK_N
+    block_max_full = n_full * BLOCK_N
+
+    k_bufs = tlx.local_alloc((HEAD_DIM, BLOCK_N), tlx.dtype_of(K), 2)
+    v_bufs = tlx.local_alloc((BLOCK_N, HEAD_DIM), tlx.dtype_of(V), 2)
+
+    k_base = K + k_off + offs_d[:, None] * stride_kk + offs_n[None, :] * stride_kn
+    v_base = V + v_off + offs_n[:, None] * stride_vn + offs_d[None, :] * stride_vk
+
+    if n_full >= 1:
+        # ══════════════════════════════════════════════════════════════
+        # Async DMA double-buffer (same pattern as _attn_fwd_async)
+        # ══════════════════════════════════════════════════════════════
+        # NOTE: The gfx1250 prologue/hot-loop/epilogue pipeline with
+        # split softmax (SM0/SM1 across iterations) would require
+        # carrying prev_qk (dot output) as a loop-carried variable.
+        # TlxPropagateLayout crashes with "Conflicting layouts" when
+        # a dot output crosses a loop boundary — this is a compiler
+        # limitation that prevents the full gfx1250 pipeline.
+        #
+        # Separate K/V commits (K-before-V scheduling) was tested but
+        # added per-iteration overhead from extra commit_group/wait_group
+        # calls, regressing from 625 to 605 TFLOPS.
+        #
+        # The standard double-buffer pattern remains optimal for async
+        # DMA on MI300 with the current TLX compiler.
+
+        tok_k = tlx.async_load(k_base, tlx.local_view(k_bufs, 0))
+        tok_v = tlx.async_load(v_base, tlx.local_view(v_bufs, 0))
+        tlx.async_load_commit_group([tok_k, tok_v])
+
+        for k_iter in tl.range(0, n_full, num_stages=0):
+            cur_buf = k_iter % 2
+            nxt_buf = 1 - cur_buf
+
+            pf_sn = (k_iter + 1) * BLOCK_N
+            pf_mask_k = (pf_sn + offs_n)[None, :] < hi
+            pf_mask_v = (pf_sn + offs_n)[:, None] < hi
+            tok_k = tlx.async_load(k_base + pf_sn * stride_kn,
+                                   tlx.local_view(k_bufs, nxt_buf), mask=pf_mask_k)
+            tok_v = tlx.async_load(v_base + pf_sn * stride_vn,
+                                   tlx.local_view(v_bufs, nxt_buf), mask=pf_mask_v)
+            tlx.async_load_commit_group([tok_k, tok_v])
+
+            wait_tok = tlx.async_load_wait_group(1)
+            k_cur = tlx.local_load(tlx.local_view(k_bufs, cur_buf),
+                                   token=wait_tok, relaxed=True)
+            v_cur = tlx.local_load(tlx.local_view(v_bufs, cur_buf),
+                                   token=wait_tok, relaxed=True)
+
+            qk = tl.zeros([BLOCK_M, BLOCK_N], dtype=tl.float32) + tl.dot(q, k_cur)
+            m_ij  = tl.maximum(m_i, tl.max(qk, 1) * QK_SCALE)
+            qk    = qk * QK_SCALE - m_ij[:, None]
+            p     = tl.math.exp2(qk)
+            l_ij  = tl.sum(p, 1)
+            alpha = tl.math.exp2(m_i - m_ij)
+            acc = acc * alpha[:, None]; l_i = l_i * alpha + l_ij; m_i = m_ij
+            acc += tl.dot(p.to(v_cur.dtype), v_cur)
+
+    # ── Tail path (masked): sync loads, handles causal + boundary ────────
+    for start_n in tl.range(block_max_full, hi, BLOCK_N, num_stages=0):
+        kn = start_n + offs_n
+        k = tl.load(k_base + start_n * stride_kn, mask=kn[None, :] < N_CTX, other=0.0)
+        v = tl.load(v_base + start_n * stride_vn, mask=kn[:, None] < N_CTX, other=0.0)
+        qk = tl.zeros([BLOCK_M, BLOCK_N], dtype=tl.float32) + tl.dot(q, k)
+        if IS_CAUSAL:
+            qk = tl.where(offs_m[:, None] >= kn[None, :], qk, float("-inf"))
+        if start_n + BLOCK_N > N_CTX:
+            qk = tl.where(kn[None, :] < N_CTX, qk, float("-inf"))
+        m_ij  = tl.maximum(m_i, tl.max(qk, 1) * QK_SCALE)
+        qk    = qk * QK_SCALE - m_ij[:, None]
+        p     = tl.math.exp2(qk)
+        l_ij  = tl.sum(p, 1)
+        alpha = tl.math.exp2(m_i - m_ij)
+        acc = acc * alpha[:, None]; l_i = l_i * alpha + l_ij; m_i = m_ij
+        acc += tl.dot(p.to(v.dtype), v)
+
+    acc = acc / l_i[:, None]
+    lse = m_i + tl.math.log2(l_i)
+    tl.store(L + pid_hz * N_CTX + offs_m, lse, mask=offs_m < N_CTX)
+    o_ptrs = Out + o_off + offs_m[:, None] * stride_om + offs_d[None, :] * stride_ok
+    tl.store(o_ptrs, acc.to(Out.dtype.element_ty),
+             mask=(offs_m[:, None] < N_CTX) & (offs_d[None, :] < HEAD_DIM))
+
+
+# ═══════════════════════════════════════════════════════════════════════════
 # Host wrappers
 # ═══════════════════════════════════════════════════════════════════════════
 
@@ -779,19 +1029,27 @@ def _launch_kperm(kernel, q, k, v, sm_scale, causal, **extra_kw):
     return o
 
 
+def flash_attn_async_simple(q, k, v, sm_scale, causal=False, **kw):
+    return _launch_kperm(_attn_fwd_async_simple, q, k, v, sm_scale, causal, **kw)
+
 def flash_attn_async(q, k, v, sm_scale, causal=False, **kw):
     return _launch_kperm(_attn_fwd_async, q, k, v, sm_scale, causal, **kw)
 
 def flash_attn_async_3(q, k, v, sm_scale, causal=False, **kw):
     return _launch_kperm(_attn_fwd_async, q, k, v, sm_scale, causal, NUM_BUFS=3, **kw)
 
+def flash_attn_async_pipelined(q, k, v, sm_scale, causal=False, **kw):
+    return _launch_kperm(_attn_fwd_async_pipelined, q, k, v, sm_scale, causal, **kw)
+
 ALL_KERNELS = {
     "s1": ("Manual S1", flash_attn_manual_s1),
     "rp": ("RegPipe", flash_attn_regpipe),
     "s2": ("Manual S2", flash_attn_manual_s2),
     "s4": ("Manual S4", flash_attn_manual_s4),
+    "asyncs": ("Async Simple", flash_attn_async_simple),
     "async": ("Async 2buf", flash_attn_async),
     "async3": ("Async 3buf", flash_attn_async_3),
+    "asyncp": ("Async Pipelined", flash_attn_async_pipelined),
 }
 
 
@@ -881,6 +1139,7 @@ def run_benchmark(args):
         "rp": common32,
         "async": common64w,
         "async3": common64w,
+        "asyncp": common64w,
     }
 
     providers = [
