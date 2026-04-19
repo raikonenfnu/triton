@@ -41,9 +41,9 @@
 #include "llvm/Support/SourceMgr.h"
 
 // TLX addition: getBuilderClass for TLX dialect Python bindings
-static py::class_<TritonOpBuilder> *builderClassPtr = nullptr;
+static pybind11::class_<TritonOpBuilder> *builderClassPtr = nullptr;
 namespace ir {
-py::class_<TritonOpBuilder> *getBuilderClass() { return builderClassPtr; }
+pybind11::class_<TritonOpBuilder> *getBuilderClass() { return builderClassPtr; }
 } // namespace ir
 
 
@@ -1871,7 +1871,7 @@ void init_triton_ir(py::module &&m) {
   // Add custom operations.
   for (const auto &plugin : mlir::triton::plugin::loadPlugins()) {
     for (const auto &op : plugin.listOps()) {
-      TritonOpBuilderBinding.def(
+      builder_cls.def(
           op.name, [op](TritonOpBuilder &self, std::vector<Value> args) {
             args.insert(args.begin(), Value());
             op.addOp(self, args);

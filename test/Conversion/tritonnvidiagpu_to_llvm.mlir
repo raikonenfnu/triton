@@ -176,8 +176,8 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32} {
   // CHECK: elect.sync
   // CHECK: "@$0 cp.async.bulk.prefetch.tensor.2d.L2.global [$1, {$2, $3}];", "b,l,r,r"
   // CHECK: return
-  tt.func @tma_prefetch(%tma: !tt.tensordesc<tensor<128x128xf32>>, %x: i32, %y: i32, %pred: i1) {
-    ttng.async_tma_prefetch %tma[%x, %y], %pred : !tt.tensordesc<tensor<128x128xf32>>
+  tt.func @tma_prefetch(%tma: !tt.tensordesc<128x128xf32>, %x: i32, %y: i32, %pred: i1) {
+    ttng.async_tma_prefetch %tma[%x, %y], %pred : !tt.tensordesc<128x128xf32>
     tt.return
   }
 }
@@ -403,8 +403,8 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, "ttg.tar
   // CHECK: elect.sync
   // CHECK: "@$0 cp.async.bulk.tensor.2d.global.shared::cta.bulk_group.L2::cache_hint [$1, {$2, $3}], [$4], $5;", "b,l,r,r,r,l" {{.*}} : (i1, !llvm.ptr, i32, i32, !llvm.ptr<3>, i64) -> !llvm.void
   // CHECK: nvvm.cp.async.bulk.commit.group
-  tt.func @tma_copy_local_to_global_l2_evict_first(%tma: !tt.tensordesc<tensor<128x128xf32, #shared1>>, %alloc: !ttg.memdesc<128x128xf32, #shared1, #smem>, %x: i32) {
-    ttng.async_tma_copy_local_to_global %tma[%x, %x] %alloc evictionPolicy = evict_first : !tt.tensordesc<tensor<128x128xf32, #shared1>>, !ttg.memdesc<128x128xf32, #shared1, #smem>
+  tt.func @tma_copy_local_to_global_l2_evict_first(%tma: !tt.tensordesc<128x128xf32, #shared1>, %alloc: !ttg.memdesc<128x128xf32, #shared1, #smem>, %x: i32) {
+    ttng.async_tma_copy_local_to_global %tma[%x, %x] %alloc evictionPolicy = evict_first : !tt.tensordesc<128x128xf32, #shared1>, !ttg.memdesc<128x128xf32, #shared1, #smem>
     tt.return
   }
 }
@@ -419,8 +419,8 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, "ttg.tar
   // CHECK: elect.sync
   // CHECK: "@$0 cp.async.bulk.tensor.2d.global.shared::cta.bulk_group.L2::cache_hint [$1, {$2, $3}], [$4], $5;", "b,l,r,r,r,l" {{.*}} : (i1, !llvm.ptr, i32, i32, !llvm.ptr<3>, i64) -> !llvm.void
   // CHECK: nvvm.cp.async.bulk.commit.group
-  tt.func @tma_copy_local_to_global_l2_evict_last(%tma: !tt.tensordesc<tensor<128x128xf32, #shared1>>, %alloc: !ttg.memdesc<128x128xf32, #shared1, #smem>, %x: i32) {
-    ttng.async_tma_copy_local_to_global %tma[%x, %x] %alloc evictionPolicy = evict_last : !tt.tensordesc<tensor<128x128xf32, #shared1>>, !ttg.memdesc<128x128xf32, #shared1, #smem>
+  tt.func @tma_copy_local_to_global_l2_evict_last(%tma: !tt.tensordesc<128x128xf32, #shared1>, %alloc: !ttg.memdesc<128x128xf32, #shared1, #smem>, %x: i32) {
+    ttng.async_tma_copy_local_to_global %tma[%x, %x] %alloc evictionPolicy = evict_last : !tt.tensordesc<128x128xf32, #shared1>, !ttg.memdesc<128x128xf32, #shared1, #smem>
     tt.return
   }
 }
@@ -435,8 +435,8 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32} {
   // CHECK: "@$0 cp.reduce.async.bulk.tensor.2d.global.shared::cta.add.bulk_group [$1, {$2, $3}], [$4];", "b,l,r,r,r" {{.*}} : (i1, !llvm.ptr, i32, i32, !llvm.ptr<3>) -> !llvm.void
   // CHECK-NOT: cp.reduce.async.bulk.tensor.2d.global.shared::cta.add.bulk_group
   // CHECK: nvvm.cp.async.bulk.commit.group
-  tt.func @async_tma_reduce(%tma: !tt.tensordesc<tensor<128x128xf32, #shared1>>, %alloc: !ttg.memdesc<128x128xf32, #shared1, #smem>, %x: i32) {
-    ttng.async_tma_reduce add, %tma[%x, %x] %alloc : !tt.tensordesc<tensor<128x128xf32, #shared1>>, !ttg.memdesc<128x128xf32, #shared1, #smem>
+  tt.func @async_tma_reduce(%tma: !tt.tensordesc<128x128xf32, #shared1>, %alloc: !ttg.memdesc<128x128xf32, #shared1, #smem>, %x: i32) {
+    ttng.async_tma_reduce add, %tma[%x, %x] %alloc : !tt.tensordesc<128x128xf32, #shared1>, !ttg.memdesc<128x128xf32, #shared1, #smem>
     tt.return
   }
 }
@@ -451,8 +451,8 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, "ttg.tar
   // CHECK: elect.sync
   // CHECK: "@$0 cp.reduce.async.bulk.tensor.2d.global.shared::cta.add.bulk_group.L2::cache_hint [$1, {$2, $3}], [$4], $5;", "b,l,r,r,r,l" {{.*}} : (i1, !llvm.ptr, i32, i32, !llvm.ptr<3>, i64) -> !llvm.void
   // CHECK: nvvm.cp.async.bulk.commit.group
-  tt.func @async_tma_reduce_l2_evict_first(%tma: !tt.tensordesc<tensor<128x128xf32, #shared1>>, %alloc: !ttg.memdesc<128x128xf32, #shared1, #smem>, %x: i32) {
-    ttng.async_tma_reduce add, %tma[%x, %x] %alloc evictionPolicy = evict_first : !tt.tensordesc<tensor<128x128xf32, #shared1>>, !ttg.memdesc<128x128xf32, #shared1, #smem>
+  tt.func @async_tma_reduce_l2_evict_first(%tma: !tt.tensordesc<128x128xf32, #shared1>, %alloc: !ttg.memdesc<128x128xf32, #shared1, #smem>, %x: i32) {
+    ttng.async_tma_reduce add, %tma[%x, %x] %alloc evictionPolicy = evict_first : !tt.tensordesc<128x128xf32, #shared1>, !ttg.memdesc<128x128xf32, #shared1, #smem>
     tt.return
   }
 }
@@ -467,8 +467,8 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, "ttg.tar
   // CHECK: elect.sync
   // CHECK: "@$0 cp.reduce.async.bulk.tensor.2d.global.shared::cta.add.bulk_group.L2::cache_hint [$1, {$2, $3}], [$4], $5;", "b,l,r,r,r,l" {{.*}} : (i1, !llvm.ptr, i32, i32, !llvm.ptr<3>, i64) -> !llvm.void
   // CHECK: nvvm.cp.async.bulk.commit.group
-  tt.func @async_tma_reduce_l2_evict_last(%tma: !tt.tensordesc<tensor<128x128xf32, #shared1>>, %alloc: !ttg.memdesc<128x128xf32, #shared1, #smem>, %x: i32) {
-    ttng.async_tma_reduce add, %tma[%x, %x] %alloc evictionPolicy = evict_last : !tt.tensordesc<tensor<128x128xf32, #shared1>>, !ttg.memdesc<128x128xf32, #shared1, #smem>
+  tt.func @async_tma_reduce_l2_evict_last(%tma: !tt.tensordesc<128x128xf32, #shared1>, %alloc: !ttg.memdesc<128x128xf32, #shared1, #smem>, %x: i32) {
+    ttng.async_tma_reduce add, %tma[%x, %x] %alloc evictionPolicy = evict_last : !tt.tensordesc<128x128xf32, #shared1>, !ttg.memdesc<128x128xf32, #shared1, #smem>
     tt.return
   }
 }
