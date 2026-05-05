@@ -88,6 +88,7 @@ class HIPOptions:
     # Option allows to set multiple variants divided by commas:
     # schedule_hint="attention,memory-bound-attention"
     schedule_hint: str = 'none'
+    llvm_flags: tuple = ()
 
     def __post_init__(self):
         gfx_major = int(self.arch[3:-2])  # Drop "gfx" prefix and minor/patch number
@@ -516,7 +517,7 @@ class HIPBackend(BaseBackend):
         assert len(names) == 1
         metadata["name"] = names[0]
         # llvm -> hsaco
-        flags = []
+        flags = list(options.llvm_flags)
         features = '-real-true16' if 'gfx11' in options.arch else ''
         ir_hash = hashlib.sha256(src.encode("utf-8")).hexdigest()
         dump_file_id = names[0] + '_' + ir_hash

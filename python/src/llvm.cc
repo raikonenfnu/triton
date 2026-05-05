@@ -110,6 +110,27 @@ void restoreLLVMOption<std::string>(const std::string &name,
   }
 }
 
+// Apply a single LLVM flag, handling both bare boolean flags and key=value pairs.
+void applyLLVMFlag(const std::string &flag) {
+  auto eq = flag.find('=');
+  if (eq != std::string::npos) {
+    std::string key = flag.substr(0, eq);
+    std::string val = flag.substr(eq + 1);
+    auto options = llvm::cl::getRegisteredOptions();
+    auto it = options.find(key);
+    if (it != options.end())
+      it->second->addOccurrence(1, key, val);
+  } else {
+    setLLVMOption<bool>(flag, true);
+  }
+}
+
+// Apply a list of LLVM flags.
+void applyLLVMFlags(const std::vector<std::string> &flags) {
+  for (const std::string &flag : flags)
+    applyLLVMFlag(flag);
+}
+
 // RAII guard that sets an LLVM option and restores it on destruction
 template <typename T> class ScopedLLVMOption {
   std::string name;
@@ -160,10 +181,7 @@ void dumpSchedulingDAG(llvm::Module &module, const std::string &triple,
     return;
   }
 
-  // Apply flags
-  for (const std::string &flag : flags) {
-    setLLVMOption<bool>(flag, true);
-  }
+  applyLLVMFlags(flags);
 
   bool disableLLVMOpt = triton::tools::getBoolEnv("DISABLE_LLVM_OPT");
   if (!disableLLVMOpt) {
@@ -252,10 +270,7 @@ translateLLVMIRToMIR(llvm::Module &module, const std::string &triple,
 
   llvm::StripDebugInfo(module);
 
-  // Apply flags
-  for (const std::string &flag : flags) {
-    setLLVMOption<bool>(flag, true);
-  }
+  applyLLVMFlags(flags);
 
   bool disableLLVMOpt = triton::tools::getBoolEnv("DISABLE_LLVM_OPT");
   if (!disableLLVMOpt) {
@@ -265,7 +280,7 @@ translateLLVMIRToMIR(llvm::Module &module, const std::string &triple,
       llvm::SmallVector<StringRef, 3> split;
       StringRef(flagList.c_str()).split(split, ',');
       for (const auto &flag : split) {
-        setLLVMOption<bool>(flag.str(), true);
+        applyLLVMFlag(flag.str());
       }
     }
   }
@@ -333,10 +348,7 @@ std::string translateLLVMIRToASM(llvm::Module &module,
                                  bool enable_fp_fusion, bool isObject) {
   using namespace mlir;
 
-  // Apply flags
-  for (const std::string &flag : flags) {
-    setLLVMOption<bool>(flag, true);
-  }
+  applyLLVMFlags(flags);
 
   if (triton::tools::getBoolEnv("LLVM_IR_ENABLE_DUMP")) {
     setLLVMOption<bool>("print-after-all", true);
@@ -350,7 +362,7 @@ std::string translateLLVMIRToASM(llvm::Module &module,
       llvm::SmallVector<StringRef, 3> split;
       StringRef(flagList.c_str()).split(split, ',');
       for (const auto &flag : split) {
-        setLLVMOption<bool>(flag.str(), true);
+        applyLLVMFlag(flag.str());
       }
     }
   }
@@ -429,10 +441,7 @@ translateMIRToASM(const std::string &mirPath, const std::string &triple,
     setLLVMOption<bool>("print-after-all", true);
   }
 
-  // Apply other flags
-  for (const std::string &flag : flags) {
-    setLLVMOption<bool>(flag, true);
-  }
+  applyLLVMFlags(flags);
 
   // Parse MIR into LLVM Module
   llvm::LLVMContext context;

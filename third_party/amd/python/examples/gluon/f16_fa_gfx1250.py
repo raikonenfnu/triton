@@ -965,7 +965,8 @@ def run_prefill_attention(config, q, k, v, o, sm_scale):
         o.stride(0), o.stride(1), o.stride(2), o.stride(3),  #
         sm_scale, SEQLEN_Q, SEQLEN_K,  #
         BLOCK_M, BLOCK_N,  #
-        HEAD_SZ, num_warps=num_warps, waves_per_eu=1)
+        HEAD_SZ, num_warps=num_warps, waves_per_eu=1,
+        )
     return (attn_kernel, )
 
 
