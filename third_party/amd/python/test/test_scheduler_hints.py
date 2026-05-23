@@ -1,3 +1,5 @@
+from pathlib import Path
+
 import pytest
 import torch
 import triton
@@ -46,3 +48,18 @@ def test_schedule_hint(device):
             continue
         assert listing_custom[lineId] == listing_default[lineId]
     assert pgm_default.asm["amdgcn"] != pgm_custom.asm["amdgcn"]
+
+
+def test_llvm_kernel_attrs_change_llir():
+    target = triton.runtime.driver.active.get_current_target()
+    attn_fwd = str(Path(__file__).parent / "attn_fwd.ttir")
+
+    baseline = triton.compile(attn_fwd, target=target)
+    with_attrs = triton.compile(
+        attn_fwd,
+        target=target,
+        options={"llvm_kernel_attrs": (("amdgpu-sched-strategy", "iterative-ilp"), )},
+    )
+
+    assert '"amdgpu-sched-strategy"="iterative-ilp"' not in baseline.asm["llir"]
+    assert '"amdgpu-sched-strategy"="iterative-ilp"' in with_attrs.asm["llir"]

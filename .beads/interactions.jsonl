@@ -1,0 +1,2 @@
+{"id":"int-1f8a0d77","kind":"field_change","created_at":"2026-05-23T23:17:44.279300106Z","actor":"Stanley Winata","issue_id":"triton-2u6","extra":{"field":"status","new_value":"closed","old_value":"in_progress","reason":"Implemented llvm_kernel_attrs option and regression coverage"}}
+{"id":"int-1366bab0","kind":"field_change","created_at":"2026-05-23T23:22:37.404684278Z","actor":"Stanley Winata","issue_id":"triton-2u6","extra":{"field":"status","new_value":"closed","old_value":"open","reason":"Removed global env flag; kept per-compile llvm_kernel_attrs option"}}

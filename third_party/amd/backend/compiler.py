@@ -13,6 +13,30 @@ import warnings
 from pathlib import Path
 
 
+def _parse_llvm_kernel_attr(attr):
+    if isinstance(attr, str):
+        name, sep, value = attr.partition("=")
+        name = name.strip()
+        value = value.strip() if sep else "true"
+    else:
+        name, value = attr
+        name = str(name).strip()
+        value = str(value).strip()
+    if not name:
+        raise ValueError(f"LLVM kernel attribute name cannot be empty: {attr!r}")
+    return (name, value)
+
+
+def _parse_llvm_kernel_attrs(attrs):
+    if attrs is None:
+        return ()
+    if isinstance(attrs, str):
+        attrs = tuple(attr.strip() for attr in attrs.split(";") if attr.strip())
+    elif isinstance(attrs, dict):
+        attrs = tuple(attrs.items())
+    return tuple(_parse_llvm_kernel_attr(attr) for attr in attrs)
+
+
 def get_min_dot_size(target: GPUTarget):
     # We fallback to use FMA and cast arguments if certain configurations is
     # not supported natively by matrix core units.
@@ -88,6 +112,7 @@ class HIPOptions:
     # Option allows to set multiple variants divided by commas:
     # schedule_hint="attention,memory-bound-attention"
     schedule_hint: str = 'none'
+    llvm_kernel_attrs: Tuple[Tuple[str, str], ...] = ()
 
     def __post_init__(self):
         gfx_major = int(self.arch[3:-2])  # Drop "gfx" prefix and minor/patch number
@@ -101,6 +126,8 @@ class HIPOptions:
                 f"kpack is deprecated starting from gfx950 and will be removed in later releases. So for now kpack = {self.kpack} will be overwritten to 1 to make transitioning easier."
             )
             object.__setattr__(self, 'kpack', 1)
+
+        object.__setattr__(self, 'llvm_kernel_attrs', _parse_llvm_kernel_attrs(self.llvm_kernel_attrs))
 
         default_libdir = Path(__file__).parent / 'lib'
         extern_libs = {} if self.extern_libs is None else dict(self.extern_libs)
@@ -457,6 +484,9 @@ class HIPBackend(BaseBackend):
         if knobs.compilation.enable_asan:
             kernel_fn.add_fn_target_feature("+xnack")
             kernel_fn.add_fn_asan_attr()
+        for name, value in options.llvm_kernel_attrs:
+            kernel_fn.remove_fn_attr(name)
+            kernel_fn.add_fn_attr(name, value)
 
         # Hint the compiler that we'd like the firmware to set the kernel arguments
         # to user SGPRs so that the kernel does not need to s_load its arguments
