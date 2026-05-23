@@ -101,3 +101,8 @@ docs/sg_execution_times.rst
 .DS_Store
 
 AGENTS.override.md
+
+# Beads / Dolt files (added by bd init)
+.dolt/
+*.db
+.beads-credential-key
