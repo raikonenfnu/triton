@@ -15,14 +15,16 @@ namespace mlir::triton::gluon {
 
 namespace {
 struct Inline : public gluon::impl::GluonInlineBase<Inline> {
+  using Base::Base;
   void runOnOperation() override;
 };
 } // namespace
 
 void Inline::runOnOperation() {
   mlir::PassManager pm(&getContext());
-  pm.addPass(createInlinerPass(/*opPipelines=*/{}, [](OpPassManager &pm) {
-    pm.addPass(gluon::createGluonSimplifyControlFlow());
+  pm.addPass(createInlinerPass(/*opPipelines=*/{}, [&](OpPassManager &pm) {
+    if (simplify)
+      pm.addPass(gluon::createGluonSimplifyControlFlow());
   }));
   if (failed(pm.run(getOperation())))
     return signalPassFailure();

@@ -169,7 +169,16 @@ void init_gluon_passes(py::module_ &m) {
   ADD_PASS_WRAPPER_0("add_resolve_auto_encodings",
                      gluon::createGluonResolveAutoEncodingsPass);
   ADD_PASS_WRAPPER_0("add_canonicalizer", gluon::createGluonCanonicalize);
-  ADD_PASS_WRAPPER_0("add_inliner", gluon::createGluonInline);
+  m.def(
+      "add_inliner",
+      [](mlir::PassManager &pm, bool simplify) {
+        gluon::GluonInlineOptions options;
+        options.simplify = simplify;
+        pm.addPass(gluon::createGluonInline(options));
+      },
+      py::arg("pm"), py::arg("simplify") = true);
+  ADD_PASS_WRAPPER_0("add_simplify_control_flow",
+                     gluon::createGluonSimplifyControlFlow);
   ADD_PASS_WRAPPER_0("add_infer_coalesced_encodings",
                      gluon::createGluonInferCoalescedEncodingsPass);
 }

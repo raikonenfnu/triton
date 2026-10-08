@@ -32,13 +32,17 @@ def GluonCanonicalize: Pass<"gluon-canonicalize"> {
 }
 
 def GluonInline: Pass<"gluon-inline"> {
-  let summary = "reduced set of simplifications for TTGIR";
+  let summary = "Inline Gluon calls with optional control-flow simplification";
 
   let description = [{
-    The `gluon-inline` pass applies a reduced set of simplification
-    and canonicalization patterns to the module.
+    Inline calls, optionally simplifying SCF and CF operations between steps.
+    Disable simplification when a later pass must preserve scope before folding.
   }];
   let dependentDialects = [];
+  let options = [
+    Option<"simplify", "simplify", "bool", /*default=*/"true",
+           "Simplify control flow while inlining">
+  ];
 }
 
 def GluonSimplifyControlFlow: Pass<"gluon-slimplify-control-flow"> {
