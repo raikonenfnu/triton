@@ -1,5 +1,34 @@
 // RUN: triton-opt %s -split-input-file -tritonamdgpu-warp-pipeline -verify-diagnostics
 
+// -----
+
+tt.func @unmatched_owner_begin() {
+  // expected-error @+1 {{unmatched warp-pipeline owner begin marker}}
+  rocdl.sched.barrier none {triton.warp_pipeline.owner_begin}
+  tt.return
+}
+
+// -----
+
+tt.func @unmatched_owner_end() {
+  // expected-error @+1 {{unmatched warp-pipeline owner end marker}}
+  rocdl.sched.barrier none {triton.warp_pipeline.owner_end}
+  tt.return
+}
+
+// -----
+
+tt.func @nested_owner_scopes() {
+  rocdl.sched.barrier none {triton.warp_pipeline.owner_begin}
+  // expected-error @+1 {{nested warp-pipeline owner scopes are not supported}}
+  rocdl.sched.barrier none {triton.warp_pipeline.owner_begin}
+  rocdl.sched.barrier none {triton.warp_pipeline.owner_end}
+  rocdl.sched.barrier none {triton.warp_pipeline.owner_end}
+  tt.return
+}
+
+// -----
+
 // Loops are not allowed inside a warp_pipeline_stage region; see isLoopOp
 // in WarpPipeliner.cpp for the rationale (no scheduling benefit, opaque to
 // MemoryEffectOpInterface, also covers the "no nested warp pipelines"

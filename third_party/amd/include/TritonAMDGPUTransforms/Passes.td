@@ -352,6 +352,18 @@ def TritonAMDGPUConvertToTensorOps : Pass<"tritonamdgpu-convert-tensor-ops", "ml
   }];
 }
 
+def TritonAMDGPUPreserveWarpPipelineOwners
+    : Pass<"tritonamdgpu-preserve-warp-pipeline-owners", "mlir::ModuleOp"> {
+  let summary = "Preserve warp-pipeline scope across loop folding and unrolling";
+  let description = [{
+    Bound loops that directly contain stage borders with internal markers.
+    WarpPipeliner consumes these markers before selecting loop owners.
+    A folded loop becomes a bounded flat pipeline instead of annotating its
+    enclosing loop.
+  }];
+  let dependentDialects = ["mlir::ROCDL::ROCDLDialect"];
+}
+
 def TritonAMDGPUWarpPipeline: Pass<"tritonamdgpu-warp-pipeline", "mlir::ModuleOp"> {
   let summary = "partition and pipeline";
 

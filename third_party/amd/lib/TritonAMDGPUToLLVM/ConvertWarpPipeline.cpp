@@ -663,18 +663,29 @@ static void processUnrolledPipelineRegions(ModuleOp m,
     if (!allocation)
       return;
 
-    // NOTE: We only iterate the function's top-level blocks; flat-pipeline
-    // execute_regions inside nested non-loop regions (e.g. scf.if bodies)
-    // are not collected.  WarpPipeliner's flat-pipeline frontend has the
-    // same scope, so the two stay in sync.
-    for (Block &block : funcOp.getBody()) {
+    // Folded owners can leave flat pipelines inside loops or conditionals.
+    // Only tagged stages are flat there. Untagged loop stages belong to the
+    // pipelined_for conversion. Accept legacy flat stages at function scope.
+    SmallVector<Block *> blocks;
+    funcOp.walk<WalkOrder::PostOrder>(
+        [&](Block *block) { blocks.push_back(block); });
+    for (Block *block : blocks) {
       // Collect contiguous sequences of flat warp-pipeline execute_regions,
       // splitting at any non-ignorable, non-pipeline op.
       SmallVector<SmallVector<scf::ExecuteRegionOp>> sequences;
       SmallVector<scf::ExecuteRegionOp> current;
+      Attribute currentGroup;
 
-      for (auto &op : block) {
-        if (auto exec = getPipelineStage(&op)) {
+      for (auto &op : *block) {
+        auto exec = getPipelineStage(&op);
+        Attribute group = op.getAttr("triton.warp_pipeline.flat");
+        if (exec && (group || block->getParentOp() == funcOp)) {
+          // Adjacent folded owners must remain separate pipelines.
+          if (!current.empty() && group != currentGroup) {
+            sequences.push_back(std::move(current));
+            current.clear();
+          }
+          currentGroup = group;
           current.push_back(exec);
           continue;
         }

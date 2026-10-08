@@ -23,8 +23,17 @@ namespace tt = mlir::triton;
 
 namespace mlir {
 
+#define GEN_PASS_DEF_TRITONAMDGPUPRESERVEWARPPIPELINEOWNERS
 #define GEN_PASS_DEF_TRITONAMDGPUWARPPIPELINE
 #include "TritonAMDGPUTransforms/Passes.h.inc"
+
+static constexpr llvm::StringLiteral kOwnerBegin =
+    "triton.warp_pipeline.owner_begin";
+static constexpr llvm::StringLiteral kOwnerEnd =
+    "triton.warp_pipeline.owner_end";
+static constexpr llvm::StringLiteral kFlatPipeline =
+    "triton.warp_pipeline.flat";
+static constexpr llvm::StringLiteral kOwner = "triton.warp_pipeline.owner";
 
 // Ops that may appear between pipeline stages but never inside one.  Pre-
 // existing memory-fence/wait ops at cluster boundaries are tolerated so that
@@ -84,7 +93,8 @@ static void addDummyOpIfEmptyCluster(OpBuilder &b, Location loc,
 // Create a scf.execute_region op representing a pipeline cluster.
 static void createClusterOp(OpBuilder &b, Location loc,
                             SmallVector<Operation *> &ops,
-                            std::pair<StringAttr, int> marker) {
+                            std::pair<StringAttr, int> marker,
+                            Attribute flatPipeline = {}) {
   assert(!ops.empty() && "empty stage");
 
   // Insert the execute_region before the first op in the cluster.
@@ -154,6 +164,8 @@ static void createClusterOp(OpBuilder &b, Location loc,
   // Keep the region structured for later conversion.
   exec.setNoInline(true);
   exec->setAttr("triton.warp_pipeline.stage", marker.first);
+  if (flatPipeline)
+    exec->setAttr(kFlatPipeline, flatPipeline);
   if (marker.second > -1) {
     exec->setAttr("triton.warp_pipeline.priority",
                   b.getI32IntegerAttr(marker.second));
@@ -167,14 +179,15 @@ static void createClusterOp(OpBuilder &b, Location loc,
 // Move pure scalar IV-remap ops after adjacent inter-stage barriers/waits so
 // they become part of the next stage.  If a barrier/wait uses one of those
 // scalars, leave the run in place to preserve SSA.
-static void sinkPureScalarsIntoNextStage(Block &blk) {
+static void sinkPureScalarsIntoNextStage(Operation *begin,
+                                         Operation *end = nullptr) {
   SmallVector<Operation *> pending;
   auto consumesPending = [&](Operation *user) {
     return llvm::any_of(user->getOperands(), [&](Value v) {
       return llvm::is_contained(pending, v.getDefiningOp());
     });
   };
-  for (Operation *op = &blk.front(); op;) {
+  for (Operation *op = begin; op && op != end;) {
     Operation *next = op->getNextNode();
     if (triton::isPureScalarOp(op)) {
       pending.push_back(op);
@@ -183,7 +196,7 @@ static void sinkPureScalarsIntoNextStage(Block &blk) {
     }
     if (canSitBetweenStages(op) && !pending.empty()) {
       Operation *anchor = op;
-      while (anchor->getNextNode() &&
+      while (anchor->getNextNode() && anchor->getNextNode() != end &&
              canSitBetweenStages(anchor->getNextNode()))
         anchor = anchor->getNextNode();
       bool conflict = false;
@@ -223,7 +236,7 @@ static PipelineResult createPipeline(OpBuilder &b, Location loc,
   SmallVector<SmallVector<Operation *>> clusters;
   auto ctx = forOp.getContext();
 
-  sinkPureScalarsIntoNextStage(blk);
+  sinkPureScalarsIntoNextStage(&blk.front());
 
   // One pass over the body; collect clusters split by explicit borders.
   for (Operation &opRef : llvm::make_early_inc_range(blk)) {
@@ -300,21 +313,24 @@ static PipelineResult createPipeline(OpBuilder &b, Location loc,
 // Returns NotApplicable when the block has no border markers, Created when
 // a flat pipeline was materialized, or Malformed when borders are present
 // but a valid pipeline could not be built (an error is emitted in that case).
-static PipelineResult createFlatPipeline(OpBuilder &b, Block &block) {
+static PipelineResult createFlatPipeline(OpBuilder &b, Block &block,
+                                         Attribute flatPipeline,
+                                         Operation *scopeBegin = nullptr,
+                                         Operation *scopeEnd = nullptr) {
   // 1. Find all border markers in this block.
   SmallVector<Operation *> allBorders;
-  for (auto &op : block)
-    if (isPipelineBorder(&op))
-      allBorders.push_back(&op);
+  Operation *first = scopeBegin ? scopeBegin->getNextNode() : &block.front();
+  for (Operation *op = first; op && op != scopeEnd; op = op->getNextNode())
+    if (isPipelineBorder(op))
+      allBorders.push_back(op);
 
   // No borders at all means the block did not opt into flat pipelining.
   if (allBorders.empty())
     return PipelineResult::NotApplicable;
 
-  // A single border cannot form a 2-stage pipeline; treat as malformed input
-  // since the user did opt in (the lone border would otherwise leak through
-  // unprocessed).
-  if (allBorders.size() < 2) {
+  // Without an owner boundary, a single border cannot form two flat stages.
+  // A bounded scope can include a second stage after its last border.
+  if (!scopeEnd && allBorders.size() < 2) {
     allBorders.front()->emitError(
         "warp_pipeline_stage requires at least two borders to form a flat "
         "pipeline");
@@ -327,17 +343,24 @@ static PipelineResult createFlatPipeline(OpBuilder &b, Block &block) {
 
   // 2. For flat pipelines, stage 0 may include the ops immediately before the
   //    first border.  Stop at ops that must stay outside this pipeline.
-  Operation *regionStart = firstBorder;
-  for (Operation *op = firstBorder->getPrevNode(); op; op = op->getPrevNode()) {
-    if (isLoopOp(op) || isa<tt::amdgpu::CondBarrierOp>(op) ||
-        canSitBetweenStages(op))
-      break;
-    regionStart = op;
+  Operation *regionStart = first;
+  if (!scopeBegin) {
+    regionStart = firstBorder;
+    for (Operation *op = firstBorder->getPrevNode(); op;
+         op = op->getPrevNode()) {
+      if (isLoopOp(op) || isa<tt::amdgpu::CondBarrierOp>(op) ||
+          canSitBetweenStages(op))
+        break;
+      regionStart = op;
+    }
   }
 
+  sinkPureScalarsIntoNextStage(regionStart, scopeEnd);
+  if (scopeBegin)
+    regionStart = scopeBegin->getNextNode();
+
   // 3. Sweep forward from regionStart, splitting ops into clusters at each
-  //    border.  Mirrors createPipeline's main loop, but bounded by lastBorder
-  //    instead of scf.yield.
+  //    border. Stop at the owner boundary, or the last border for legacy input.
   SmallVector<Operation *> cluster;
   SmallVector<std::pair<StringAttr, int>> clusterMarkers;
   SmallVector<SmallVector<Operation *>> clusters;
@@ -346,13 +369,16 @@ static PipelineResult createFlatPipeline(OpBuilder &b, Block &block) {
     Operation *op = &*it;
     ++it;
 
+    if (op == scopeEnd)
+      break;
+
     if (isPipelineBorder(op)) {
       clusterMarkers.push_back(readBorderMarker(op));
       addDummyOpIfEmptyCluster(b, loc, op, cluster);
       clusters.push_back(std::move(cluster));
       cluster.clear();
 
-      bool isLast = (op == lastBorder);
+      bool isLast = !scopeEnd && (op == lastBorder);
       op->erase();
       if (isLast)
         break;
@@ -381,6 +407,11 @@ static PipelineResult createFlatPipeline(OpBuilder &b, Block &block) {
     cluster.push_back(op);
   }
 
+  if (scopeEnd && !cluster.empty()) {
+    clusters.push_back(std::move(cluster));
+    clusterMarkers.emplace_back(b.getStringAttr("last_cluster"), -1);
+  }
+
   // 4. The bounded sweep should produce at least two clusters.
   if (clusters.size() < 2) {
     mlir::emitError(
@@ -391,11 +422,87 @@ static PipelineResult createFlatPipeline(OpBuilder &b, Block &block) {
   for (auto &&[stageOps, marker] : llvm::zip(clusters, clusterMarkers)) {
     if (stageOps.empty())
       continue;
-    createClusterOp(b, loc, stageOps, marker);
+    createClusterOp(b, loc, stageOps, marker, flatPipeline);
   }
 
   LDBG("[warp-pipeline] flat pipeline with " << clusters.size() << " stages");
   return PipelineResult::Created;
+}
+
+struct TritonAMDGPUPreserveWarpPipelineOwnersPass
+    : impl::TritonAMDGPUPreserveWarpPipelineOwnersBase<
+          TritonAMDGPUPreserveWarpPipelineOwnersPass> {
+  void runOnOperation() override {
+    OpBuilder builder(getOperation());
+    getOperation().walk([&](scf::ForOp loop) {
+      if (loop->hasAttr(kOwner) ||
+          llvm::none_of(*loop.getBody(),
+                        [](Operation &op) { return isPipelineBorder(&op); }))
+        return;
+      loop->setAttr(kOwner, builder.getUnitAttr());
+      // Parent-block markers survive when the loop body is spliced or cloned.
+      // Reuse scheduling barriers so canonicalization retains the boundaries.
+      builder.setInsertionPoint(loop);
+      auto begin = ROCDL::SchedBarrier::create(builder, loop.getLoc(),
+                                               ROCDL::SchedGroupMask::none);
+      begin->setAttr(kOwnerBegin, builder.getUnitAttr());
+      builder.setInsertionPointAfter(loop);
+      auto end = ROCDL::SchedBarrier::create(builder, loop.getLoc(),
+                                             ROCDL::SchedGroupMask::none);
+      end->setAttr(kOwnerEnd, builder.getUnitAttr());
+    });
+  }
+};
+
+// Recover folded owners before looking for borders in surviving loop bodies.
+// A flat pipeline keeps its own identity, including beside another flat owner.
+static LogicalResult recoverOwnerScopes(OpBuilder &builder, tt::FuncOp func,
+                                        int64_t &nextFlatPipeline) {
+  SmallVector<Block *> blocks;
+  func.walk<WalkOrder::PostOrder>(
+      [&](Block *block) { blocks.push_back(block); });
+  for (Block *block : blocks) {
+    SmallVector<std::pair<Operation *, Operation *>> scopes;
+    Operation *begin = nullptr;
+    for (Operation &op : *block) {
+      if (op.hasAttr(kOwnerBegin)) {
+        if (begin)
+          return op.emitError("nested warp-pipeline owner scopes are not "
+                              "supported");
+        begin = &op;
+      } else if (op.hasAttr(kOwnerEnd)) {
+        if (!begin)
+          return op.emitError("unmatched warp-pipeline owner end marker");
+        scopes.emplace_back(begin, &op);
+        begin = nullptr;
+      }
+    }
+    if (begin)
+      return begin->emitError("unmatched warp-pipeline owner begin marker");
+
+    for (auto [scopeBegin, scopeEnd] : scopes) {
+      // Partial unrolling can leave a surviving owner followed by a flat tail.
+      // Partition at those loops, but still reject loops inside a flat stage.
+      SmallVector<Operation *> boundaries;
+      for (Operation *op = scopeBegin->getNextNode(); op != scopeEnd;
+           op = op->getNextNode())
+        if (isa<scf::ForOp>(op) && op->hasAttr(kOwner))
+          boundaries.push_back(op);
+      boundaries.push_back(scopeEnd);
+
+      Operation *segmentBegin = scopeBegin;
+      for (Operation *segmentEnd : boundaries) {
+        auto group = builder.getI64IntegerAttr(nextFlatPipeline++);
+        if (createFlatPipeline(builder, *block, group, segmentBegin,
+                               segmentEnd) == PipelineResult::Malformed)
+          return failure();
+        segmentBegin = segmentEnd;
+      }
+      scopeBegin->erase();
+      scopeEnd->erase();
+    }
+  }
+  return success();
 }
 
 struct TritonAMDGPUWarpPipelinePass
@@ -406,8 +513,14 @@ struct TritonAMDGPUWarpPipelinePass
     ModuleOp m = getOperation();
     OpBuilder builder(m);
     bool malformed = false;
+    int64_t nextFlatPipeline = 0;
     for (auto funcOp : m.getOps<tt::FuncOp>()) {
+      if (failed(recoverOwnerScopes(builder, funcOp, nextFlatPipeline))) {
+        signalPassFailure();
+        return;
+      }
       funcOp.walk([&](scf::ForOp forOp) {
+        forOp->removeAttr(kOwner);
         Location loc = forOp.getLoc();
         switch (createPipeline(builder, loc, forOp)) {
         case PipelineResult::NotApplicable:
@@ -421,11 +534,11 @@ struct TritonAMDGPUWarpPipelinePass
         }
       });
 
-      // Process remaining border markers in flat (non-loop) code.  Only the
-      // function's top-level blocks are visited; borders inside nested
-      // non-loop regions (e.g. scf.if bodies) are not handled here.
+      // Recognize legacy unbounded flat pipelines only at function scope.
+      // Folded owners above provide explicit bounds for nested pipelines.
       for (Block &block : funcOp.getBody()) {
-        switch (createFlatPipeline(builder, block)) {
+        switch (createFlatPipeline(
+            builder, block, builder.getI64IntegerAttr(nextFlatPipeline++))) {
         case PipelineResult::NotApplicable:
           break;
         case PipelineResult::Created:

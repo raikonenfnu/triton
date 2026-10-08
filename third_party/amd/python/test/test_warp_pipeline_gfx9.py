@@ -1,5 +1,7 @@
 import re
 
+import pytest
+
 import triton
 import triton.language as tl
 from triton import knobs
@@ -12,13 +14,62 @@ NUM_WARPS = 4
 BLOCK = 128
 
 
-def _compile_gluon(fn, signature, constexprs, arch="gfx950"):
-    """Compile a Gluon kernel for gfx950 and return the compiled object."""
+def _compile_gluon(fn, signature, constexprs, arch="gfx950", warp_size=64):
+    """Compile a Gluon kernel for the requested AMD target."""
     # TRITON_OVERRIDE_ARCH would replace gfx950 for any arch
     with knobs.runtime.scope():
         knobs.runtime.override_arch = None
         return triton.compile(src=gluon._runtime.GluonASTSource(fn, signature, constexprs),
-                              target=GPUTarget("hip", arch, 64), options={"num_warps": NUM_WARPS})
+                              target=GPUTarget("hip", arch, warp_size), options={"num_warps": NUM_WARPS})
+
+
+@gluon.jit
+def _pipeline_owner_stages(A, B, offs, k):
+    with warp_pipeline_stage("load", priority=1):
+        value = gl.load(A + offs)
+    with warp_pipeline_stage("store", priority=0):
+        gl.store(B + offs, value + k)
+
+
+@gluon.jit
+def pipeline_nested_owner(A, B, N, INNER: gl.constexpr, WAIT: gl.constexpr, HELPER: gl.constexpr,
+                          WARP_SIZE: gl.constexpr = 64):
+    layout: gl.constexpr = gl.BlockedLayout([1], [WARP_SIZE], [gl.num_warps()], [0])
+    offs = gl.arange(0, 256, layout=layout)
+    for tile in range(N):
+        gl.store(B + offs, -1)
+        if WAIT:
+            gl.amd.cdna4.async_copy.wait_group(0)
+        for k in range(INNER):
+            if HELPER:
+                _pipeline_owner_stages(A, B, offs, k)
+            else:
+                with warp_pipeline_stage("load", priority=1):
+                    value = gl.load(A + offs)
+                with warp_pipeline_stage("store", priority=0):
+                    gl.store(B + offs, value + k)
+        gl.amd.cdna4.async_copy.wait_group(0)
+        gl.store(B + offs, gl.load(B + offs) + 1)
+
+
+@pytest.mark.parametrize("inner", [0, 1, 4])
+@pytest.mark.parametrize("wait", [False, True])
+@pytest.mark.parametrize("helper", [False, True])
+@pytest.mark.parametrize("arch, warp_size", [("gfx950", 64), ("gfx1250", 32)])
+def test_pipeline_nested_loop_ownership(inner, wait, helper, arch, warp_size):
+    signature = {
+        "A": "*i32", "B": "*i32", "N": "i32", "INNER": "constexpr", "WAIT": "constexpr", "HELPER": "constexpr",
+        "WARP_SIZE": "constexpr"
+    }
+    constexprs = {"INNER": inner, "WAIT": wait, "HELPER": helper, "WARP_SIZE": warp_size}
+    k = _compile_gluon(pipeline_nested_owner, signature, constexprs, arch, warp_size)
+    ttgir = k.asm["ttgir"]
+    assert "triton.warp_pipeline.owner" not in ttgir
+    assert "triton.warp_pipeline.border" not in ttgir
+    assert ttgir.count("triton.warp_pipeline.pipelined_for") == int(inner > 1)
+    assert ("triton.warp_pipeline.flat" in ttgir) == (inner == 1)
+    if inner:
+        assert "s_setprio" in k.asm["amdgcn"]
 
 
 @gluon.jit

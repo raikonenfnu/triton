@@ -504,7 +504,10 @@ class HIPBackend(BaseBackend):
         pm = ir.pass_manager(mod.context)
         pm.enable_debug()
 
-        passes.gluon.add_inliner(pm)
+        # Expose stages in JIT helpers before folding their owning loops.
+        passes.gluon.add_inliner(pm, simplify=False)
+        amd.passes.ttgpuir.add_preserve_warp_pipeline_owners(pm)
+        passes.gluon.add_simplify_control_flow(pm)
         passes.gluon.add_infer_coalesced_encodings(pm)
         passes.gluon.add_resolve_auto_encodings(pm)
         passes.common.add_sccp(pm)
