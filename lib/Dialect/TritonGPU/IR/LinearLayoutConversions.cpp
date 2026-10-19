@@ -1554,6 +1554,8 @@ LinearLayout chooseScaledMfmaScaleLayout(MLIRContext *ctx, int dotOperandIdx,
                                          ArrayRef<unsigned> tilesPerWarp,
                                          ArrayRef<unsigned> warpsPerCTA) {
   unsigned rank = dotOperandShape.size();
+  assert((rank == 2 || rank == 3) && "expected [M|N, K] or [batch, M|N, K]");
+  assert(warpsPerCTA.size() == rank && tilesPerWarp.size() == rank);
   auto order = mlir::triton::gpu::getMatrixOrder(rank, /*rowMajor=*/true);
   auto standardOutDims = standardOutDimNames(ctx, rank);
   StringAttr kRegister = StringAttr::get(ctx, "register");
@@ -1581,7 +1583,7 @@ LinearLayout chooseScaledMfmaScaleLayout(MLIRContext *ctx, int dotOperandIdx,
   // For mxfp4, these 32 elements are consecutive, so only 1 scale element
   // is required. But for mxfp6/mxfp8, there are 2 16-consecutive elements
   // blocks, so 2 scale elements are required.
-  int32_t kSize = dotOperandShape[1];
+  int32_t kSize = dotOperandShape[rank - 1];
 
   std::vector<std::vector<int32_t>> registerBase;
   std::vector<std::vector<int32_t>> laneBase;
@@ -1614,23 +1616,36 @@ LinearLayout chooseScaledMfmaScaleLayout(MLIRContext *ctx, int dotOperandIdx,
   LinearLayout tileLayout({{kRegister, registerBase}, {kLane, laneBase}},
                           {outDimNames[order[0]], outDimNames[order[1]]});
 
-  SmallVector<unsigned> warpsPerCTANew =
-      (dotOperandIdx == 1)
-          ? SmallVector<unsigned>{warpsPerCTA[1], warpsPerCTA[0]}
-          : SmallVector<unsigned>{warpsPerCTA[0], warpsPerCTA[1]};
+  // Warps tile the scale as they tile the operand it scales, in the MFMA
+  // warp order ([batch,] M, N; N fastest). The scale of B is [batch,] N, K
+  // while B is [batch,] K, N, so its last two warp dimensions swap. Warps
+  // along the other matrix dimension land on the scale's K dimension, which
+  // the tile already covers, so combineCtaCgaWithShape broadcasts them.
+  SmallVector<unsigned> warpShape(warpsPerCTA.begin(), warpsPerCTA.end());
+  SmallVector<unsigned> warpOrder =
+      mlir::triton::gpu::getMatrixOrder(rank, /*rowMajor=*/true);
+  if (dotOperandIdx == 1) {
+    std::swap(warpShape[rank - 2], warpShape[rank - 1]);
+    for (unsigned &dim : warpOrder) {
+      if (dim == rank - 2)
+        dim = rank - 1;
+      else if (dim == rank - 1)
+        dim = rank - 2;
+    }
+  }
 
-  SmallVector<unsigned> warpOrder = (dotOperandIdx == 1)
-                                        ? SmallVector<unsigned>{0, 1}
-                                        : SmallVector<unsigned>{1, 0};
+  LinearLayout warpLayout = identityStandardND(kWarp, warpShape, warpOrder);
+  // Extend the layout to the shape in [K, M|N, batch] order, as the operand
+  // layouts do: the scaled MFMA lowering walks the scale's register repeats
+  // in the same order as the operands' repeats.
+  SmallVector<StringAttr> extendOrder;
+  for (unsigned dim : order)
+    extendOrder.push_back(outDimNames[dim]);
+  LinearLayout ctaLayout = (tileLayout * warpLayout).transposeOuts(extendOrder);
 
-  LinearLayout warpLayout =
-      identityStandardND(kWarp, warpsPerCTANew, warpOrder);
-  LinearLayout ctaLayout = tileLayout.transposeOuts(outDimNames) *
-                           warpLayout.transposeOuts(outDimNames);
-
-  auto cgaLayout = CGAEncodingAttr::get1CTALayout(ctx, 2);
-  auto finalLay = combineCtaCgaWithShape(ctaLayout, cgaLayout, dotOperandShape);
-  return finalLay;
+  auto cgaLayout = CGAEncodingAttr::get1CTALayout(ctx, rank);
+  return combineCtaCgaWithShape(ctaLayout, cgaLayout, dotOperandShape)
+      .transposeOuts(outDimNames);
 }
 
 std::optional<LinearLayout>

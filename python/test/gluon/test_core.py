@@ -2952,6 +2952,64 @@ def test_amd_mfma_scaled(M, N, K, a_type, b_type, cd_regclass, has_scale, device
     _check_cd_regclass_pins(compiled.asm['llir'], cd_regclass)
 
 
+@gluon.jit
+def _load_rank3(ptr, D0: ttgl.constexpr, D1: ttgl.constexpr, D2: ttgl.constexpr, layout: ttgl.constexpr):
+    blocked: ttgl.constexpr = ttgl.BlockedLayout([1, 1, 1], [1, 1, 64], [ttgl.num_warps(), 1, 1], [2, 1, 0])
+    i = ttgl.arange(0, D0, ttgl.SliceLayout(1, ttgl.SliceLayout(2, blocked)))[:, None, None]
+    j = ttgl.arange(0, D1, ttgl.SliceLayout(0, ttgl.SliceLayout(2, blocked)))[None, :, None]
+    k = ttgl.arange(0, D2, ttgl.SliceLayout(0, ttgl.SliceLayout(1, blocked)))[None, None, :]
+    return ttgl.convert_layout(ttgl.load(ptr + (i * D1 + j) * D2 + k), layout)
+
+
+@pytest.mark.skipif(not is_hip_cdna4(), reason="Requires CDNA4")
+@pytest.mark.parametrize("warps", [(2, 1, 2), (1, 2, 2), (2, 2, 1), (4, 1, 1)])
+def test_amd_mfma_scaled_batched(warps, device='cuda'):
+    B, M, N, K = 4, 32, 32, 256
+
+    @gluon.jit
+    def kernel(out_ptr, a_ptr, b_ptr, a_scale_ptr, b_scale_ptr,  #
+               B: ttgl.constexpr, M: ttgl.constexpr, N: ttgl.constexpr, K: ttgl.constexpr, WARPS: ttgl.constexpr):
+        mfma_layout: ttgl.constexpr = ttgl.amd.AMDMFMALayout(version=4, instr_shape=[16, 16, 128], transposed=True,
+                                                             warps_per_cta=WARPS)
+        a_layout: ttgl.constexpr = ttgl.DotOperandLayout(operand_index=0, parent=mfma_layout, k_width=16)
+        b_layout: ttgl.constexpr = ttgl.DotOperandLayout(operand_index=1, parent=mfma_layout, k_width=16)
+        a_scale_layout: ttgl.constexpr = ttgl.amd.cdna4.get_mfma_scale_layout(a_layout, [B, M, K // 32])
+        b_scale_layout: ttgl.constexpr = ttgl.amd.cdna4.get_mfma_scale_layout(b_layout, [B, N, K // 32])
+        a = _load_rank3(a_ptr, B, M, K // 2, a_layout)
+        b = _load_rank3(b_ptr, B, K // 2, N, b_layout)
+        a_scale = _load_rank3(a_scale_ptr, B, M, K // 32, a_scale_layout)
+        b_scale = _load_rank3(b_scale_ptr, B, N, K // 32, b_scale_layout)
+        acc = ttgl.zeros([B, M, N], dtype=ttgl.float32, layout=mfma_layout)
+        c = ttgl.amd.cdna4.mfma_scaled(a, a_scale, "e2m1", b, b_scale, "e2m1", acc)
+        out_layout: ttgl.constexpr = ttgl.BlockedLayout([1, 1, 1], [1, 1, 64], [ttgl.num_warps(), 1, 1], [2, 1, 0])
+        c = ttgl.convert_layout(c, out_layout)
+        i = ttgl.arange(0, B, ttgl.SliceLayout(1, ttgl.SliceLayout(2, out_layout)))[:, None, None]
+        j = ttgl.arange(0, M, ttgl.SliceLayout(0, ttgl.SliceLayout(2, out_layout)))[None, :, None]
+        k = ttgl.arange(0, N, ttgl.SliceLayout(0, ttgl.SliceLayout(1, out_layout)))[None, None, :]
+        ttgl.store(out_ptr + (i * M + j) * N + k, c)
+
+    torch.manual_seed(0)
+    a_mxfp4 = MXFP4Tensor(size=(B * M, K)).random()
+    a = a_mxfp4.to_packed_tensor(1).view(B, M, K // 2).to(device)
+    a_ref = a_mxfp4.to(torch.float32).view(B, M, K).to(device)
+    b_mxfp4 = MXFP4Tensor(size=(B * K, N)).random()
+    b = b_mxfp4.to_packed_tensor(0).view(B, K // 2, N).to(device)
+    b_ref = b_mxfp4.to(torch.float32).view(B, K, N).to(device)
+    a_scale = MXScaleTensor(size=(B * M, K // 32)).random(1 / 32, 32)
+    b_scale = MXScaleTensor(size=(B * N, K // 32)).random(1 / 32, 32)
+    a_scale_ref = a_scale.to(torch.float32).repeat_interleave(32, dim=1).view(B, M, K).to(device)
+    b_scale_ref = b_scale.to(torch.float32).repeat_interleave(32, dim=1).view(B, N, K).transpose(1, 2).to(device)
+
+    out = torch.empty((B, M, N), dtype=torch.float32, device=device)
+    num_warps = warps[0] * warps[1] * warps[2]
+    compiled = kernel[(1, )](out, a, b, a_scale.data.view(B, M, K // 32).to(device),
+                             b_scale.data.view(B, N, K // 32).to(device), B, M, N, K, warps, num_warps=num_warps)
+    out_ref = torch.bmm(a_ref * a_scale_ref, b_ref * b_scale_ref)
+    # Products are exact; only the FP32 summation order differs from bmm.
+    torch.testing.assert_close(out, out_ref, rtol=1e-6, atol=1e-6 * out_ref.abs().max().item())
+    assert 'v_mfma_scale_f32_16x16x128_f8f6f4' in compiled.asm['amdgcn']
+
+
 def test_math_fast_expf():
 
     @gluon.jit
