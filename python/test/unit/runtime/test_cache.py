@@ -1,4 +1,5 @@
 import expecttest
+import dataclasses
 import importlib.util
 import itertools
 import multiprocessing
@@ -1266,3 +1267,34 @@ def test_module_load_unload(device, fresh_knobs):
     assert pre_compile.module is None
     # turn on garbage collector
     gc.enable()
+
+
+@dataclasses.dataclass(frozen=True)
+class _Tile:
+    rows: int
+    cols: int
+
+
+def test_hooks_see_non_json_constexpr(device, fresh_triton_cache):
+    # Any hashable object may be a compile-time argument; a compile hook must
+    # not break on one that JSON cannot encode.
+
+    @triton.jit
+    def kernel(o, TILE: tl.constexpr, N: tl.constexpr):
+        tl.store(o + tl.arange(0, N), 1.0)
+
+    specialization_data = None
+
+    def cache_hook(*args, **kwargs):
+        nonlocal specialization_data
+        specialization_data = kwargs["compile"]["specialization_data"]
+
+    triton.knobs.runtime.jit_cache_hook = cache_hook
+    out = torch.zeros(32, device=device)
+    kernel[(1, )](out, _Tile(2, 16), 32)
+    assert torch.all(out == 1.0)
+    assert "_Tile: _Tile(rows=2, cols=16)" in specialization_data
+
+    with pytest.raises(RuntimeError, match="cannot be rebuilt"):
+        kernel.preload(specialization_data)
+

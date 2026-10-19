@@ -377,6 +377,14 @@ class KernelInterface(Generic[T]):
         # return cast(T, functools.partial(cast(Callable, self.run), grid=grid))
 
 
+def _unserializable_constant(value):
+    # A compile-time argument may be any hashable Python object (for example a
+    # frozen dataclass a Gluon kernel reads through constexpr functions). Keep
+    # its repr so compile hooks still see the specialization; ``preload``
+    # rejects it, since the object cannot be rebuilt from JSON.
+    return {"unserializable": f"{type(value).__qualname__}: {value!r}"}
+
+
 def serialize_specialization_data(name, signature, constants, attrs, options, key, target):
     constants = {
         key: str(value) if value.__class__.__name__ == "dtype" else {"constexpr": value.value}
@@ -391,7 +399,7 @@ def serialize_specialization_data(name, signature, constants, attrs, options, ke
         list(constants.values()), 'attrs_keys': [list(x) for x in attrs.keys()], 'attrs_vals': list(attrs.values()),
         'options': options.__dict__, 'key': key, 'target': target.__dict__
     }
-    serialized_obj = json.dumps(obj)
+    serialized_obj = json.dumps(obj, default=_unserializable_constant)
     return serialized_obj
 
 
@@ -855,6 +863,9 @@ class JITFunction(JITCallable, KernelInterface[T]):
             if tl.dtype.is_dtype(value):
                 return tl.dtype(value)
             if isinstance(value, dict):
+                if 'unserializable' in value:
+                    raise RuntimeError(f"Cannot preload {self._fn_name}: compile-time argument "
+                                       f"{value['unserializable']} cannot be rebuilt from its serialized form")
                 if 'constexpr' in value:
                     return tl.constexpr(convert_to_tuple_if_list(value['constexpr']))
                 if 'jit_function' in value:
